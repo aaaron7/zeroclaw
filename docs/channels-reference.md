@@ -427,6 +427,13 @@ Notes:
 allowed_contacts = ["*"]
 ```
 
+iMessage runtime behavior (phase 1 autonomous task engine):
+
+- iMessage requests are executed through a persistent task-run path.
+- Long-running tasks continue autonomously without requiring users to send a follow-up `continue`.
+- For filesystem-write claims, completion requires post-write verification evidence (write + read/check).
+- Task state and events are persisted under workspace `state/task-runs.db` for restart-aware recovery.
+
 ---
 
 ## 5. Validation Workflow

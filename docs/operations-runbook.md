@@ -60,6 +60,7 @@ zeroclaw service status
 | Channel connectivity | `zeroclaw channel doctor` | configured channels healthy |
 | Runtime summary | `zeroclaw status` | expected provider/model/channels |
 | Daemon heartbeat/state | `~/.zeroclaw/daemon_state.json` | file updates periodically |
+| iMessage task engine state (phase 1) | `~/.zeroclaw/workspace/state/task-runs.db` | task status transitions visible (`queued/running/completed/failed`) |
 
 ## Logs and Diagnostics
 
@@ -73,6 +74,19 @@ zeroclaw service status
 ```bash
 journalctl --user -u zeroclaw.service -f
 ```
+
+### Task engine quick checks (iMessage phase 1)
+
+```bash
+sqlite3 ~/.zeroclaw/workspace/state/task-runs.db "select id,status,attempt_count,provider_retry_count,updated_at from task_runs order by updated_at desc limit 20;"
+sqlite3 ~/.zeroclaw/workspace/state/task-runs.db "select task_id,event_type,created_at from task_events order by id desc limit 50;"
+```
+
+Use these queries when operators need to confirm:
+
+- autonomous continuation occurred without user follow-up prompts
+- provider transport retries were applied
+- write-verification milestone events were recorded before completion claims
 
 ## Incident Triage Flow (Fast Path)
 

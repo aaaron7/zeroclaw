@@ -60,6 +60,7 @@ zeroclaw service status
 | Kết nối channel | `zeroclaw channel doctor` | các channel đã cấu hình đều khoẻ mạnh |
 | Tóm tắt runtime | `zeroclaw status` | provider/model/channels như mong đợi |
 | Heartbeat/trạng thái daemon | `~/.zeroclaw/daemon_state.json` | file được cập nhật định kỳ |
+| Trạng thái iMessage task engine (giai đoạn 1) | `~/.zeroclaw/workspace/state/task-runs.db` | thấy được chuyển trạng thái task (`queued/running/completed/failed`) |
 
 ## Log và Chẩn đoán
 
@@ -73,6 +74,19 @@ zeroclaw service status
 ```bash
 journalctl --user -u zeroclaw.service -f
 ```
+
+### Kiểm tra nhanh task engine (iMessage giai đoạn 1)
+
+```bash
+sqlite3 ~/.zeroclaw/workspace/state/task-runs.db "select id,status,attempt_count,provider_retry_count,updated_at from task_runs order by updated_at desc limit 20;"
+sqlite3 ~/.zeroclaw/workspace/state/task-runs.db "select task_id,event_type,created_at from task_events order by id desc limit 50;"
+```
+
+Dùng các truy vấn này khi operator cần xác nhận:
+
+- cơ chế tiếp tục tự chủ đã chạy mà không cần người dùng gửi thêm lệnh follow-up
+- retry cho lỗi provider transport đã được áp dụng
+- mốc sự kiện xác minh ghi file đã xuất hiện trước khi tuyên bố hoàn tất
 
 ## Quy trình Phân loại Sự cố (Fast Path)
 

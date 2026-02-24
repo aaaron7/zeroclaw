@@ -186,6 +186,30 @@ zeroclaw channel doctor
 
 Sau đó xác minh thông tin xác thực và trường allowlist cho từng kênh trong config.
 
+### iMessage báo "đã lưu" nhưng không thấy file
+
+Các bước kiểm tra:
+
+1. Xác nhận sự kiện task engine đã được ghi trong DB trạng thái workspace:
+
+```bash
+sqlite3 ~/.zeroclaw/workspace/state/task-runs.db "select id,status,updated_at from task_runs order by updated_at desc limit 10;"
+```
+
+2. Xác nhận mốc xác minh ghi file đã xuất hiện (event type `tool_write_verified`).
+3. Kiểm tra log runtime để tìm thông báo continuation của guardrail/task-engine.
+
+Hành vi kỳ vọng:
+
+- Với iMessage, các tuyên bố hoàn tất ghi file không được finalize nếu chưa có bằng chứng xác minh sau ghi.
+- Nếu thiếu bằng chứng, task phải tiếp tục xử lý hoặc fail tường minh (không được báo thành công im lặng).
+
+Nếu hành vi khác kỳ vọng:
+
+- restart runtime (`zeroclaw daemon` hoặc restart service)
+- chạy lại yêu cầu một lần và thu thập log + các dòng mới nhất từ `task_runs`
+- tạo issue kèm provider/model và dòng log guardrail/task-engine chính xác
+
 ## Chế độ dịch vụ
 
 ### Dịch vụ đã cài nhưng không chạy

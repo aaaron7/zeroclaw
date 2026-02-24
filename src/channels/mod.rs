@@ -223,6 +223,7 @@ struct ChannelRuntimeContext {
     multimodal: crate::config::MultimodalConfig,
     hooks: Option<Arc<crate::hooks::HookRunner>>,
     non_cli_excluded_tools: Arc<Vec<String>>,
+    task_engine: Option<Arc<crate::agent::task_engine::TaskEngine>>,
 }
 
 #[derive(Clone)]
@@ -1690,9 +1691,26 @@ async fn process_channel_message(
     // Record history length before tool loop so we can extract tool context after.
     let history_len_before_tools = history.len();
 
+    struct ChannelLlmOutcome {
+        response: String,
+        write_verified: bool,
+    }
+
     enum LlmExecutionResult {
-        Completed(Result<Result<String, anyhow::Error>, tokio::time::error::Elapsed>),
+        Completed(Result<Result<ChannelLlmOutcome, anyhow::Error>, tokio::time::error::Elapsed>),
         Cancelled,
+    }
+
+    let use_imessage_task_engine = msg.channel == "imessage" && ctx.task_engine.is_some();
+    if use_imessage_task_engine {
+        if let Some(channel) = target_channel.as_ref() {
+            let _ = channel
+                .send(
+                    &SendMessage::new("🧠 已接管任务并开始执行。", &msg.reply_target)
+                        .in_thread(msg.thread_ts.clone()),
+                )
+                .await;
+        }
     }
 
     let timeout_budget_secs =
@@ -1701,28 +1719,70 @@ async fn process_channel_message(
         () = cancellation_token.cancelled() => LlmExecutionResult::Cancelled,
         result = tokio::time::timeout(
             Duration::from_secs(timeout_budget_secs),
-            run_tool_call_loop(
-                active_provider.as_ref(),
-                &mut history,
-                ctx.tools_registry.as_ref(),
-                ctx.observer.as_ref(),
-                route.provider.as_str(),
-                route.model.as_str(),
-                runtime_defaults.temperature,
-                true,
-                None,
-                msg.channel.as_str(),
-                &ctx.multimodal,
-                ctx.max_tool_iterations,
-                Some(cancellation_token.clone()),
-                delta_tx,
-                ctx.hooks.as_deref(),
-                if msg.channel == "cli" {
-                    &[]
-                } else {
-                    ctx.non_cli_excluded_tools.as_ref()
-                },
-            ),
+            async {
+                if msg.channel == "imessage" {
+                    if let Some(engine) = ctx.task_engine.as_ref() {
+                        let req = crate::agent::task_engine::TaskRunRequest {
+                            channel: msg.channel.as_str(),
+                            sender_key: msg.sender.as_str(),
+                            reply_target: msg.reply_target.as_str(),
+                            original_request: msg.content.as_str(),
+                            provider: active_provider.as_ref(),
+                            history: &mut history,
+                            tools_registry: ctx.tools_registry.as_ref(),
+                            observer: ctx.observer.as_ref(),
+                            provider_name: route.provider.as_str(),
+                            model: route.model.as_str(),
+                            temperature: runtime_defaults.temperature,
+                            multimodal: &ctx.multimodal,
+                            max_tool_iterations: ctx.max_tool_iterations,
+                            cancellation_token: Some(cancellation_token.clone()),
+                            on_delta: delta_tx.clone(),
+                            hooks: ctx.hooks.as_deref(),
+                            excluded_tools: if msg.channel == "cli" {
+                                &[]
+                            } else {
+                                ctx.non_cli_excluded_tools.as_ref()
+                            },
+                        };
+                        let outcome =
+                            crate::agent::task_engine::TaskEngine::run_task(req, engine.as_ref())
+                                .await?;
+                        return Ok(ChannelLlmOutcome {
+                            response: outcome.final_response,
+                            write_verified: outcome.write_verified,
+                        });
+                    }
+                }
+
+                let response = run_tool_call_loop(
+                    active_provider.as_ref(),
+                    &mut history,
+                    ctx.tools_registry.as_ref(),
+                    ctx.observer.as_ref(),
+                    route.provider.as_str(),
+                    route.model.as_str(),
+                    runtime_defaults.temperature,
+                    true,
+                    None,
+                    msg.channel.as_str(),
+                    &ctx.multimodal,
+                    ctx.max_tool_iterations,
+                    Some(cancellation_token.clone()),
+                    delta_tx.clone(),
+                    ctx.hooks.as_deref(),
+                    if msg.channel == "cli" {
+                        &[]
+                    } else {
+                        ctx.non_cli_excluded_tools.as_ref()
+                    },
+                )
+                .await?;
+                Ok(ChannelLlmOutcome {
+                    response,
+                    write_verified: false,
+                })
+            },
         ) => LlmExecutionResult::Completed(result),
     };
 
@@ -1770,9 +1830,19 @@ async fn process_channel_message(
                 }
             }
         }
-        LlmExecutionResult::Completed(Ok(Ok(response))) => {
+        LlmExecutionResult::Completed(Ok(Ok(outcome))) => {
+            if outcome.write_verified {
+                if let Some(channel) = target_channel.as_ref() {
+                    let _ = channel
+                        .send(
+                            &SendMessage::new("✅ 文件写入已完成校验。", &msg.reply_target)
+                                .in_thread(msg.thread_ts.clone()),
+                        )
+                        .await;
+                }
+            }
             // ── Hook: on_message_sending (modifying) ─────────
-            let mut outbound_response = response;
+            let mut outbound_response = outcome.response;
             if let Some(hooks) = &ctx.hooks {
                 match hooks
                     .run_on_message_sending(
@@ -2153,6 +2223,56 @@ async fn run_message_dispatch_loop(
 
     while let Some(result) = workers.join_next().await {
         log_worker_join_result(result);
+    }
+}
+
+fn recover_pending_imessage_tasks(ctx: Arc<ChannelRuntimeContext>) {
+    let Some(engine) = ctx.task_engine.as_ref() else {
+        return;
+    };
+
+    let recoverable = match engine.store().list_recoverable_tasks() {
+        Ok(items) => items,
+        Err(err) => {
+            tracing::warn!("Failed to list recoverable task runs: {err}");
+            return;
+        }
+    };
+
+    for task in recoverable {
+        if task.channel != "imessage" {
+            continue;
+        }
+
+        // Mark stale pre-restart task and replay from original request as a new run.
+        let _ = engine
+            .store()
+            .update_status(&task.id, crate::agent::task_types::TaskStatus::Failed);
+        let _ = engine.store().append_event(
+            &task.id,
+            "recovered_as_replay",
+            Some(&serde_json::json!({
+                "reason": "process_restart",
+            })),
+        );
+
+        let replay_msg = traits::ChannelMessage {
+            id: format!("recovery-{}", task.id),
+            sender: task.sender_key.clone(),
+            reply_target: task.reply_target.clone(),
+            content: task.original_request.clone(),
+            channel: "imessage".to_string(),
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            thread_ts: None,
+        };
+
+        let worker_ctx = Arc::clone(&ctx);
+        tokio::spawn(async move {
+            process_channel_message(worker_ctx, replay_msg, CancellationToken::new()).await;
+        });
     }
 }
 
@@ -3258,6 +3378,16 @@ pub async fn start_channels(config: Config) -> Result<()> {
         .telegram
         .as_ref()
         .is_some_and(|tg| tg.interrupt_on_new_message);
+    let task_engine =
+        match crate::agent::task_engine::TaskEngine::default_for_workspace(&config.workspace_dir) {
+            Ok(engine) => Some(Arc::new(engine)),
+            Err(err) => {
+                tracing::warn!(
+                    "Failed to initialize task engine; iMessage autonomous mode disabled: {err}"
+                );
+                None
+            }
+        };
 
     let runtime_ctx = Arc::new(ChannelRuntimeContext {
         channels_by_name,
@@ -3293,8 +3423,10 @@ pub async fn start_channels(config: Config) -> Result<()> {
             None
         },
         non_cli_excluded_tools: Arc::new(config.autonomy.non_cli_excluded_tools.clone()),
+        task_engine,
     });
 
+    recover_pending_imessage_tasks(Arc::clone(&runtime_ctx));
     run_message_dispatch_loop(rx, runtime_ctx, max_in_flight_messages).await;
 
     // Wait for all channel tasks
@@ -3506,6 +3638,7 @@ mod tests {
             workspace_dir: Arc::new(std::env::temp_dir()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            task_engine: None,
         };
 
         assert!(compact_sender_history(&ctx, &sender));
@@ -3555,6 +3688,7 @@ mod tests {
             workspace_dir: Arc::new(std::env::temp_dir()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            task_engine: None,
         };
 
         append_sender_turn(&ctx, &sender, ChatMessage::user("hello"));
@@ -3607,6 +3741,7 @@ mod tests {
             workspace_dir: Arc::new(std::env::temp_dir()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            task_engine: None,
         };
 
         assert!(rollback_orphan_user_turn(&ctx, &sender, "pending"));
@@ -3652,10 +3787,45 @@ mod tests {
         sent_messages: tokio::sync::Mutex<Vec<String>>,
     }
 
+    #[derive(Default)]
+    struct IMessageRecordingChannel {
+        sent_messages: tokio::sync::Mutex<Vec<String>>,
+    }
+
     #[async_trait::async_trait]
     impl Channel for TelegramRecordingChannel {
         fn name(&self) -> &str {
             "telegram"
+        }
+
+        async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
+            self.sent_messages
+                .lock()
+                .await
+                .push(format!("{}:{}", message.recipient, message.content));
+            Ok(())
+        }
+
+        async fn listen(
+            &self,
+            _tx: tokio::sync::mpsc::Sender<traits::ChannelMessage>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn start_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn stop_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Channel for IMessageRecordingChannel {
+        fn name(&self) -> &str {
+            "imessage"
         }
 
         async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
@@ -3983,6 +4153,20 @@ BTC is currently around $65,000 based on latest tool output."#
         models: std::sync::Mutex<Vec<String>>,
     }
 
+    struct ScriptedResponseProvider {
+        responses: std::sync::Mutex<Vec<anyhow::Result<String>>>,
+        call_count: AtomicUsize,
+    }
+
+    impl ScriptedResponseProvider {
+        fn new(responses: Vec<anyhow::Result<String>>) -> Self {
+            Self {
+                responses: std::sync::Mutex::new(responses),
+                call_count: AtomicUsize::new(0),
+            }
+        }
+    }
+
     #[async_trait::async_trait]
     impl Provider for ModelCaptureProvider {
         async fn chat_with_system(
@@ -4007,6 +4191,33 @@ BTC is currently around $65,000 based on latest tool output."#
                 .unwrap_or_else(|e| e.into_inner())
                 .push(model.to_string());
             Ok("ok".to_string())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for ScriptedResponseProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            Ok("fallback".to_string())
+        }
+
+        async fn chat_with_history(
+            &self,
+            _messages: &[ChatMessage],
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            self.call_count.fetch_add(1, Ordering::SeqCst);
+            let mut guard = self.responses.lock().unwrap_or_else(|e| e.into_inner());
+            if guard.is_empty() {
+                return Ok("done".to_string());
+            }
+            guard.remove(0)
         }
     }
 
@@ -4080,6 +4291,7 @@ BTC is currently around $65,000 based on latest tool output."#
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: false,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            task_engine: None,
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
         });
@@ -4139,6 +4351,7 @@ BTC is currently around $65,000 based on latest tool output."#
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: false,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            task_engine: None,
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
         });
@@ -4214,6 +4427,7 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            task_engine: None,
         });
 
         process_channel_message(
@@ -4273,6 +4487,7 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            task_engine: None,
         });
 
         process_channel_message(
@@ -4341,6 +4556,7 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            task_engine: None,
         });
 
         process_channel_message(
@@ -4375,6 +4591,97 @@ BTC is currently around $65,000 based on latest tool output."#
 
         assert_eq!(default_provider_impl.call_count.load(Ordering::SeqCst), 0);
         assert_eq!(fallback_provider_impl.call_count.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_imessage_task_engine_runs_to_completion_without_followup() {
+        let channel_impl = Arc::new(IMessageRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let tmp = TempDir::new().expect("tempdir");
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace dir");
+
+        let provider_impl = Arc::new(ScriptedResponseProvider::new(vec![
+            Ok("我正在检查当前文件状态。".to_string()),
+            Ok("任务已完成。".to_string()),
+        ]));
+
+        let task_engine = crate::agent::task_engine::TaskEngine::new(
+            &workspace,
+            crate::agent::task_engine::TaskEngineConfig {
+                max_continuation_rounds: 4,
+                provider_retry_limit: 0,
+            },
+        )
+        .expect("task engine");
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider: provider_impl.clone(),
+            default_provider: Arc::new("test-provider".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("test-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 5,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(workspace.clone()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: false,
+            multimodal: crate::config::MultimodalConfig::default(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
+            task_engine: Some(Arc::new(task_engine)),
+        });
+
+        process_channel_message(
+            runtime_ctx.clone(),
+            traits::ChannelMessage {
+                id: "msg-imessage-1".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "imessage-chat".to_string(),
+                content: "帮我继续执行直到完成".to_string(),
+                channel: "imessage".to_string(),
+                timestamp: 1,
+                thread_ts: None,
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let sent = channel_impl.sent_messages.lock().await;
+        assert_eq!(sent.len(), 2);
+        assert!(sent[0].contains("🧠 已接管任务并开始执行。"));
+        assert!(sent[1].contains("任务已完成。"));
+        drop(sent);
+
+        assert_eq!(provider_impl.call_count.load(Ordering::SeqCst), 2);
+
+        let db_path = workspace.join("state").join("task-runs.db");
+        let conn = rusqlite::Connection::open(db_path).expect("task db");
+        let (status, attempts): (String, i64) = conn
+            .query_row(
+                "SELECT status, attempt_count FROM task_runs ORDER BY created_at DESC LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("task run row");
+        assert_eq!(status, "completed");
+        assert!(attempts >= 2);
     }
 
     #[tokio::test]
@@ -4430,6 +4737,7 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            task_engine: None,
         });
 
         process_channel_message(
@@ -4501,6 +4809,7 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            task_engine: None,
         });
 
         process_channel_message(
@@ -4587,6 +4896,7 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            task_engine: None,
         });
 
         process_channel_message(
@@ -4658,6 +4968,7 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            task_engine: None,
         });
 
         process_channel_message(
@@ -4718,6 +5029,7 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            task_engine: None,
         });
 
         process_channel_message(
@@ -4889,6 +5201,7 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            task_engine: None,
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(4);
@@ -4969,6 +5282,7 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            task_engine: None,
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(8);
@@ -5061,6 +5375,7 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            task_engine: None,
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(8);
@@ -5135,6 +5450,7 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            task_engine: None,
         });
 
         process_channel_message(
@@ -5194,6 +5510,7 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            task_engine: None,
         });
 
         process_channel_message(
@@ -5718,6 +6035,7 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            task_engine: None,
         });
 
         process_channel_message(
@@ -5803,6 +6121,7 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            task_engine: None,
         });
 
         process_channel_message(
@@ -5888,6 +6207,7 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            task_engine: None,
         });
 
         process_channel_message(
@@ -6437,6 +6757,7 @@ This is an example JSON object for profile settings."#;
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            task_engine: None,
         });
 
         // Simulate a photo attachment message with [IMAGE:] marker.
@@ -6503,6 +6824,7 @@ This is an example JSON object for profile settings."#;
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            task_engine: None,
         });
 
         process_channel_message(

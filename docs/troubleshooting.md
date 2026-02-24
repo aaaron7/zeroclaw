@@ -192,6 +192,30 @@ zeroclaw channel doctor
 
 Then verify channel-specific credentials + allowlist fields in config.
 
+### iMessage task says \"saved\" but no file exists
+
+Checks:
+
+1. Confirm task engine events are present in workspace state DB:
+
+```bash
+sqlite3 ~/.zeroclaw/workspace/state/task-runs.db "select id,status,updated_at from task_runs order by updated_at desc limit 10;"
+```
+
+2. Confirm write-verification milestones were emitted (event type `tool_write_verified`).
+3. Inspect runtime logs for guardrail/task-engine continuation messages.
+
+Expected behavior:
+
+- iMessage completion claims for file writes should not finalize without post-write verification evidence.
+- If evidence is missing, the task should continue or fail explicitly (not silently succeed).
+
+If behavior differs:
+
+- restart runtime (`zeroclaw daemon` or service restart)
+- re-run the request once and collect logs + latest `task_runs` rows
+- file an issue with provider/model + exact guardrail/task-engine log lines
+
 ## Service Mode
 
 ### Service installed but not running
