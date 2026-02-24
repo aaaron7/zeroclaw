@@ -343,6 +343,13 @@ allowed_users = ["*"]
 allowed_contacts = ["*"]
 ```
 
+iMessage runtime behavior (giai đoạn 1 task engine tự chủ):
+
+- Yêu cầu iMessage được thực thi qua luồng task-run có lưu trạng thái.
+- Tác vụ dài tiếp tục tự động mà không cần người dùng gửi `continue`.
+- Với các tuyên bố ghi file, chỉ hoàn tất khi có bằng chứng xác minh sau ghi (write + read/check).
+- Trạng thái và sự kiện task được lưu tại `workspace/state/task-runs.db` để hỗ trợ phục hồi sau khi runtime khởi động lại.
+
 ---
 
 ## 5. Quy trình xác thực
