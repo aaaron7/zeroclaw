@@ -2273,9 +2273,9 @@ pub(crate) async fn run_tool_call_loop(
     let mut seen_tool_signatures: HashSet<(String, String)> = HashSet::new();
     let mut saw_verified_filesystem_write = false;
     let mut pending_post_write_read_verification = false;
-    let mut write_claim_guard_triggered = false;
-    let mut language_guard_triggered = false;
-    let mut autonomy_guard_triggered = false;
+    let mut write_claim_guard_hits: u32 = 0;
+    let mut language_guard_hits: u32 = 0;
+    let mut autonomy_guard_hits: u32 = 0;
     let mut saw_any_tool_execution = false;
 
     for iteration in 0..max_iterations {
@@ -2528,19 +2528,15 @@ pub(crate) async fn run_tool_call_loop(
                     "Guardrail blocked non-Chinese final response for Chinese user input"
                 );
 
-                if language_guard_triggered {
-                    anyhow::bail!(
-                        "Guardrail: response language mismatch persisted after correction request"
-                    );
-                }
-
-                language_guard_triggered = true;
+                language_guard_hits = language_guard_hits.saturating_add(1);
                 history.push(ChatMessage::assistant(response_text.clone()));
-                history.push(ChatMessage::user(
+                history.push(ChatMessage::user(format!(
                     "[Language Guard]\n\
-                     用户上一条请求是中文。请用中文继续完成任务并给出最终答复。\n\
+                     触发原因：用户上一条请求是中文，但你的回复不是中文（第 {} 次）。\n\
+                     请用中文继续完成任务并给出最终答复。\n\
                      除非用户明确要求英文，否则不要切换到英文。",
-                ));
+                    language_guard_hits
+                )));
                 continue;
             }
 
@@ -2553,32 +2549,30 @@ pub(crate) async fn run_tool_call_loop(
                     "Guardrail blocked unverified filesystem-write completion claim"
                 );
 
-                if write_claim_guard_triggered {
-                    anyhow::bail!(
-                        "Guardrail: model claimed filesystem write completion without verified write tool execution"
-                    );
-                }
-
-                write_claim_guard_triggered = true;
+                write_claim_guard_hits = write_claim_guard_hits.saturating_add(1);
                 history.push(ChatMessage::assistant(response_text.clone()));
                 if prefer_chinese {
-                    history.push(ChatMessage::user(
+                    history.push(ChatMessage::user(format!(
                         "[Verification Guard]\n\
-                         你上一条回复声称已完成文件写入，但缺少写后校验证据。\n\
+                         触发原因：你上一条回复声称已完成文件写入，但缺少写后校验证据（第 {} 次）。\n\
                          在最终回复前请完成以下之一：\n\
                          1) 重新检查目标文件，并在写入后使用 file_read 或 shell（`ls`/`wc`/`cat`）验证，再报告证据。\n\
-                         2) 明确说明文件/报告尚未写入完成。",
-                    ));
+                         2) 明确说明文件/报告尚未写入完成。\n\
+                         不要仅口头声明“已保存/已写入”。",
+                        write_claim_guard_hits
+                    )));
                 } else {
-                    history.push(ChatMessage::user(
+                    history.push(ChatMessage::user(format!(
                         "[Verification Guard]\n\
-                         Your previous response claimed filesystem write completion, but no verified \
-                         post-write evidence is available.\n\
+                         Trigger reason: your previous response claimed filesystem write completion, \
+                         but no verified post-write evidence is available (attempt {}).\n\
                          Before finalizing, do one of:\n\
                          1) Execute or re-check the target file and verify with file_read or shell \
                          (`ls`/`wc`/`cat`) AFTER the write step, then report evidence.\n\
-                         2) Explicitly state that no file/report has been written yet.",
-                    ));
+                         2) Explicitly state that no file/report has been written yet.\n\
+                         Do not claim \"saved/written\" without evidence.",
+                        write_claim_guard_hits
+                    )));
                 }
                 continue;
             }
@@ -2590,26 +2584,27 @@ pub(crate) async fn run_tool_call_loop(
                     "Guardrail blocked premature pause before completing task"
                 );
 
-                if autonomy_guard_triggered {
-                    anyhow::bail!("Guardrail: model paused before completing requested task");
-                }
-
-                autonomy_guard_triggered = true;
+                autonomy_guard_hits = autonomy_guard_hits.saturating_add(1);
                 history.push(ChatMessage::assistant(response_text.clone()));
                 if prefer_chinese {
-                    history.push(ChatMessage::user(
+                    history.push(ChatMessage::user(format!(
                         "[Autonomy Guard]\n\
-                         任务尚未明确完成时，不要要求用户再发“继续”或额外确认。\n\
+                         触发原因：任务尚未明确完成，但你请求用户继续/确认（第 {} 次）。\n\
+                         任务未完成前，不要要求用户再发“继续”或额外确认。\n\
                          请继续自主执行，直到完成原始请求再给出最终结果。\n\
                          只有在确实缺少必要信息或权限时，才向用户提问。",
-                    ));
+                        autonomy_guard_hits
+                    )));
                 } else {
-                    history.push(ChatMessage::user(
+                    history.push(ChatMessage::user(format!(
                         "[Autonomy Guard]\n\
+                         Trigger reason: task is not complete, but you asked user for \"continue\"/extra confirmation \
+                         (attempt {}).\n\
                          Do not ask the user to send \"continue\" or extra confirmation before the task is complete.\n\
                          Keep working autonomously until the original request is completed, then provide the final result.\n\
                          Ask the user only when essential information or permissions are truly missing.",
-                    ));
+                        autonomy_guard_hits
+                    )));
                 }
                 continue;
             }
@@ -2967,6 +2962,68 @@ pub(crate) async fn run_tool_call_loop(
                 history.push(ChatMessage::tool(tool_msg.to_string()));
             }
         }
+    }
+
+    if write_claim_guard_hits > 0 || language_guard_hits > 0 || autonomy_guard_hits > 0 {
+        let prefer_chinese = user_prefers_chinese_response(history);
+        let mut reasons: Vec<&str> = Vec::new();
+        if write_claim_guard_hits > 0 {
+            reasons.push("文件写入声明缺少可验证证据 / filesystem write claim lacked verifiable evidence");
+        }
+        if language_guard_hits > 0 {
+            reasons.push("回复语言与用户不一致 / response language mismatched user language");
+        }
+        if autonomy_guard_hits > 0 {
+            reasons.push("任务未完成就暂停 / paused before task completion");
+        }
+        let reason_lines = reasons
+            .iter()
+            .map(|reason| format!("- {reason}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        tracing::warn!(
+            provider = provider_name,
+            model = model,
+            write_claim_guard_hits,
+            language_guard_hits,
+            autonomy_guard_hits,
+            "Guardrail exhausted max iterations; returning soft-fail notice"
+        );
+
+        runtime_trace::record_event(
+            "guardrail_soft_fail",
+            Some(channel_name),
+            Some(provider_name),
+            Some(model),
+            Some(&turn_id),
+            Some(false),
+            Some("guardrail exhausted max iterations"),
+            serde_json::json!({
+                "max_iterations": max_iterations,
+                "write_claim_guard_hits": write_claim_guard_hits,
+                "language_guard_hits": language_guard_hits,
+                "autonomy_guard_hits": autonomy_guard_hits,
+            }),
+        );
+
+        let notice = if prefer_chinese {
+            format!(
+                "[Guardrail Notice]\n\
+                 本轮未直接报错中断，而是持续尝试纠正；但已达到最大迭代次数，仍未得到可验证结果。\n\
+                 触发原因：\n{reason_lines}\n\
+                 已停止继续猜测式回复。请继续执行“先工具操作，再给证据，再总结结果”的流程。"
+            )
+        } else {
+            format!(
+                "[Guardrail Notice]\n\
+                 The turn was not hard-aborted; correction was retried repeatedly. \
+                 However, max iterations were reached without verifiable completion.\n\
+                 Trigger reasons:\n{reason_lines}\n\
+                 Stopping speculative finalization. Continue with: tool action -> evidence -> final summary."
+            )
+        };
+        return Ok(notice);
     }
 
     runtime_trace::record_event(
@@ -4089,8 +4146,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_tool_call_loop_blocks_unverified_filesystem_write_claims() {
+    async fn run_tool_call_loop_soft_fails_unverified_filesystem_write_claims() {
         let provider = ScriptedProvider::from_text_responses(vec![
+            "I wrote the report to docs/report.md.",
+            "I wrote the report to docs/report.md.",
             "I wrote the report to docs/report.md.",
             "I wrote the report to docs/report.md.",
         ]);
@@ -4102,7 +4161,7 @@ mod tests {
         let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
         let observer = NoopObserver;
 
-        let err = run_tool_call_loop(
+        let result = run_tool_call_loop(
             &provider,
             &mut history,
             &tools_registry,
@@ -4121,9 +4180,10 @@ mod tests {
             &[],
         )
         .await
-        .expect_err("guardrail should block repeated unverified write claims");
+        .expect("guardrail should return soft-fail notice instead of hard error");
 
-        assert!(err.to_string().contains("Guardrail"));
+        assert!(result.contains("[Guardrail Notice]"));
+        assert!(result.contains("filesystem write claim"));
         assert!(
             history
                 .iter()
@@ -4133,11 +4193,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_tool_call_loop_blocks_write_claim_without_post_write_read_verification() {
+    async fn run_tool_call_loop_soft_fails_write_claim_without_post_write_read_verification() {
         let provider = ScriptedProvider::from_text_responses(vec![
             r#"<tool_call>
 {"name":"file_write","arguments":{"value":"A"}}
 </tool_call>"#,
+            "I wrote the report to docs/report.md.",
+            "I wrote the report to docs/report.md.",
             "I wrote the report to docs/report.md.",
             "I wrote the report to docs/report.md.",
         ]);
@@ -4154,7 +4216,7 @@ mod tests {
         ];
         let observer = NoopObserver;
 
-        let err = run_tool_call_loop(
+        let result = run_tool_call_loop(
             &provider,
             &mut history,
             &tools_registry,
@@ -4166,16 +4228,16 @@ mod tests {
             None,
             "cli",
             &crate::config::MultimodalConfig::default(),
-            4,
+            5,
             None,
             None,
             None,
             &[],
         )
         .await
-        .expect_err("write claim should be blocked without post-write read verification");
+        .expect("write-claim guard should return soft-fail notice");
 
-        assert!(err.to_string().contains("Guardrail"));
+        assert!(result.contains("[Guardrail Notice]"));
         assert_eq!(invocations.load(Ordering::SeqCst), 1);
     }
 
@@ -4237,8 +4299,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_tool_call_loop_blocks_non_chinese_final_response_for_chinese_user() {
+    async fn run_tool_call_loop_soft_fails_non_chinese_final_response_for_chinese_user() {
         let provider = ScriptedProvider::from_text_responses(vec![
+            "I have completed the report.",
+            "I have completed the report.",
             "I have completed the report.",
             "I have completed the report.",
         ]);
@@ -4250,7 +4314,7 @@ mod tests {
         let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
         let observer = NoopObserver;
 
-        let err = run_tool_call_loop(
+        let result = run_tool_call_loop(
             &provider,
             &mut history,
             &tools_registry,
@@ -4269,9 +4333,10 @@ mod tests {
             &[],
         )
         .await
-        .expect_err("language guard should block repeated non-Chinese output");
+        .expect("language guard should return soft-fail notice");
 
-        assert!(err.to_string().contains("language mismatch"));
+        assert!(result.contains("[Guardrail Notice]"));
+        assert!(result.contains("response language mismatched user language"));
         assert!(
             history
                 .iter()
@@ -4281,11 +4346,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_tool_call_loop_blocks_premature_pause_before_completion() {
+    async fn run_tool_call_loop_soft_fails_premature_pause_before_completion() {
         let provider = ScriptedProvider::from_text_responses(vec![
             r#"<tool_call>
 {"name":"file_read","arguments":{"value":"A"}}
 </tool_call>"#,
+            "If you'd like, I can continue expanding the report.",
+            "If you'd like, I can continue expanding the report.",
             "If you'd like, I can continue expanding the report.",
             "If you'd like, I can continue expanding the report.",
         ]);
@@ -4302,7 +4369,7 @@ mod tests {
         ];
         let observer = NoopObserver;
 
-        let err = run_tool_call_loop(
+        let result = run_tool_call_loop(
             &provider,
             &mut history,
             &tools_registry,
@@ -4321,9 +4388,10 @@ mod tests {
             &[],
         )
         .await
-        .expect_err("autonomy guard should block repeated premature pause");
+        .expect("autonomy guard should return soft-fail notice");
 
-        assert!(err.to_string().contains("paused before completing"));
+        assert!(result.contains("[Guardrail Notice]"));
+        assert!(result.contains("paused before task completion"));
         assert_eq!(invocations.load(Ordering::SeqCst), 1);
         assert!(
             history
