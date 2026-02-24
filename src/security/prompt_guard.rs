@@ -93,11 +93,12 @@ impl PromptGuard {
         total_score += self.check_command_injection(content, &mut detected_patterns);
         total_score += self.check_jailbreak_attempts(content, &mut detected_patterns);
 
-        // Normalize score to 0.0-1.0 range (max possible is 6.0, one per category)
-        let normalized_score = (total_score / 6.0).min(1.0);
+        // Each category contributes a calibrated 0.0-1.0 risk increment.
+        // Cap accumulated risk to keep final score in 0.0-1.0.
+        let normalized_score = total_score.min(1.0);
 
         if !detected_patterns.is_empty() {
-            if normalized_score >= self.sensitivity {
+            if normalized_score > self.sensitivity {
                 match self.action {
                     GuardAction::Block => GuardResult::Blocked(format!(
                         "Potential prompt injection detected (score: {:.2}): {}",
@@ -120,6 +121,7 @@ impl PromptGuard {
         let regexes = SYSTEM_OVERRIDE_PATTERNS.get_or_init(|| {
             vec![
                 Regex::new(r"(?i)ignore\s+(previous|all|above|prior)\s+(instructions?|prompts?|commands?)").unwrap(),
+                Regex::new(r"(?i)ignore\s+all\s+previous\s+(instructions?|prompts?|commands?)").unwrap(),
                 Regex::new(r"(?i)disregard\s+(previous|all|above|prior)").unwrap(),
                 Regex::new(r"(?i)forget\s+(previous|all|everything|above)").unwrap(),
                 Regex::new(r"(?i)new\s+(instructions?|rules?|system\s+prompt)").unwrap(),
@@ -185,6 +187,7 @@ impl PromptGuard {
             vec![
                 Regex::new(r"(?i)(list|show|print|display|reveal|tell\s+me)\s+(all\s+)?(secrets?|credentials?|passwords?|tokens?|keys?)").unwrap(),
                 Regex::new(r"(?i)(what|show)\s+(are|is|me)\s+(your|the)\s+(api\s+)?(keys?|secrets?|credentials?)").unwrap(),
+                Regex::new(r"(?i)(list|show|print|display|reveal|tell\s+me).*(api\s+)?keys?.*(secrets?|credentials?|tokens?|passwords?)").unwrap(),
                 Regex::new(r"(?i)contents?\s+of\s+(vault|secrets?|credentials?)").unwrap(),
                 Regex::new(r"(?i)(dump|export)\s+(vault|secrets?|credentials?)").unwrap(),
             ]
