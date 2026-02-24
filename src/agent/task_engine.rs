@@ -8,6 +8,7 @@ use crate::observability::Observer;
 use crate::providers::{ChatMessage, Provider};
 use crate::tools::Tool;
 use anyhow::Result;
+use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -39,6 +40,8 @@ pub struct TaskEngine {
     cfg: TaskEngineConfig,
 }
 
+pub type TaskProgressReporter = Arc<dyn Fn(String) + Send + Sync>;
+
 pub struct TaskRunRequest<'a> {
     pub channel: &'a str,
     pub sender_key: &'a str,
@@ -57,6 +60,7 @@ pub struct TaskRunRequest<'a> {
     pub on_delta: Option<mpsc::Sender<String>>,
     pub hooks: Option<&'a HookRunner>,
     pub excluded_tools: &'a [String],
+    pub progress_reporter: Option<TaskProgressReporter>,
 }
 
 impl TaskEngine {
@@ -107,6 +111,10 @@ impl TaskEngine {
             .update_status(&task_id, TaskStatus::Running)
             .ok();
         engine.store.append_event(&task_id, "started", None).ok();
+        emit_progress(
+            &req,
+            "🧠 任务已接管，进入自主执行模式。将持续汇报每一轮推进状态。",
+        );
 
         engine.run_existing_task(&task_id, &mut req).await
     }
@@ -120,10 +128,18 @@ impl TaskEngine {
         let mut consecutive_progress_only = 0usize;
 
         for round in 0..self.cfg.max_continuation_rounds {
-            let response = self
-                .execute_single_round_with_retry(task_id, req)
-                .await
-                .map_err(|err| {
+            emit_progress(
+                req,
+                format!(
+                    "🔄 第 {}/{} 轮执行中…",
+                    round + 1,
+                    self.cfg.max_continuation_rounds
+                ),
+            );
+
+            let response = match self.execute_single_round_with_retry(task_id, req).await {
+                Ok(response) => response,
+                Err(err) => {
                     let msg = format!("{err:#}");
                     let _ = self.store.update_status(task_id, TaskStatus::Failed);
                     let _ = self.store.append_event(
@@ -131,8 +147,10 @@ impl TaskEngine {
                         "failed",
                         Some(&serde_json::json!({"reason":"provider_error","error":msg})),
                     );
-                    err
-                })?;
+                    emit_progress(req, "❌ 执行失败（provider/transport 错误）。");
+                    return Err(err);
+                }
+            };
 
             let _ = self.store.increment_attempt_count(task_id);
             let _ = self.store.set_last_response(task_id, &response);
@@ -149,6 +167,7 @@ impl TaskEngine {
                 let _ = self
                     .store
                     .append_event(task_id, "tool_write_verified", None);
+                emit_progress(req, "✅ 检测到写后校验证据（write + read/check）。");
             }
 
             match eval.decision {
@@ -159,6 +178,7 @@ impl TaskEngine {
                         "completed",
                         Some(&serde_json::json!({"round": round + 1})),
                     );
+                    emit_progress(req, format!("✅ 任务完成（第 {} 轮）。", round + 1));
                     return Ok(TaskRunOutcome {
                         task_id: task_id.to_string(),
                         final_response: response,
@@ -171,6 +191,14 @@ impl TaskEngine {
                         "continue",
                         Some(&serde_json::json!({"reason": reason, "round": round + 1})),
                     );
+                    emit_progress(
+                        req,
+                        format!(
+                            "⏳ 第 {} 轮尚未完成（{}），继续推进…",
+                            round + 1,
+                            explain_continue_reason(&reason)
+                        ),
+                    );
                     consecutive_progress_only += 1;
                     if consecutive_progress_only >= 3 {
                         let msg = "Task stalled in repeated progress-only replies".to_string();
@@ -180,6 +208,7 @@ impl TaskEngine {
                             "failed",
                             Some(&serde_json::json!({"reason":"stalled_loop"})),
                         );
+                        emit_progress(req, "❌ 连续进度汇报未产出有效结果，任务失败。");
                         anyhow::bail!("{msg}");
                     }
                     req.history.push(ChatMessage::user(
@@ -194,6 +223,13 @@ impl TaskEngine {
             task_id,
             "failed",
             Some(&serde_json::json!({"reason":"max_continuation_rounds_exhausted"})),
+        );
+        emit_progress(
+            req,
+            format!(
+                "❌ 已达到最大轮数 {}，任务失败。",
+                self.cfg.max_continuation_rounds
+            ),
         );
         anyhow::bail!(
             "Task exceeded max continuation rounds ({})",
@@ -242,6 +278,14 @@ impl TaskEngine {
                                 "error": format!("{err:#}")
                             })),
                         );
+                        emit_progress(
+                            req,
+                            format!(
+                                "🌐 Provider 连接异常，重试 {}/{} …",
+                                attempt + 1,
+                                self.cfg.provider_retry_limit
+                            ),
+                        );
                         last_error = Some(err);
                         continue;
                     }
@@ -261,6 +305,21 @@ fn is_retryable_provider_transport_error(err: &anyhow::Error) -> bool {
         || lower.contains("connection reset")
         || lower.contains("connection refused")
         || lower.contains("timed out")
+}
+
+fn emit_progress(req: &TaskRunRequest<'_>, message: impl Into<String>) {
+    if let Some(reporter) = req.progress_reporter.as_ref() {
+        reporter(message.into());
+    }
+}
+
+fn explain_continue_reason(reason: &str) -> &str {
+    match reason {
+        "write_claim_without_post_write_verification" => "检测到写入声明但缺少写后校验",
+        "in_progress_update" => "仅汇报进行中状态",
+        "guardrail_notice" => "触发 guardrail 继续执行",
+        _ => reason,
+    }
 }
 
 #[cfg(test)]
@@ -351,6 +410,7 @@ mod tests {
             on_delta: None,
             hooks: None,
             excluded_tools: &[],
+            progress_reporter: None,
         };
 
         let outcome = TaskEngine::run_task(req, &engine)
@@ -405,6 +465,7 @@ mod tests {
             on_delta: None,
             hooks: None,
             excluded_tools: &[],
+            progress_reporter: None,
         };
 
         let outcome = TaskEngine::run_task(req, &engine)

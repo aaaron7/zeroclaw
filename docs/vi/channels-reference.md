@@ -347,6 +347,7 @@ iMessage runtime behavior (giai đoạn 1 task engine tự chủ):
 
 - Yêu cầu iMessage được thực thi qua luồng task-run có lưu trạng thái.
 - Tác vụ dài tiếp tục tự động mà không cần người dùng gửi `continue`.
+- Runtime phát thông báo tiến độ theo từng vòng để operator quan sát trạng thái thực thi theo thời gian thực.
 - Với các tuyên bố ghi file, chỉ hoàn tất khi có bằng chứng xác minh sau ghi (write + read/check).
 - Trạng thái và sự kiện task được lưu tại `workspace/state/task-runs.db` để hỗ trợ phục hồi sau khi runtime khởi động lại.
 

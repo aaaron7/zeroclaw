@@ -1693,24 +1693,11 @@ async fn process_channel_message(
 
     struct ChannelLlmOutcome {
         response: String,
-        write_verified: bool,
     }
 
     enum LlmExecutionResult {
         Completed(Result<Result<ChannelLlmOutcome, anyhow::Error>, tokio::time::error::Elapsed>),
         Cancelled,
-    }
-
-    let use_imessage_task_engine = msg.channel == "imessage" && ctx.task_engine.is_some();
-    if use_imessage_task_engine {
-        if let Some(channel) = target_channel.as_ref() {
-            let _ = channel
-                .send(
-                    &SendMessage::new("🧠 已接管任务并开始执行。", &msg.reply_target)
-                        .in_thread(msg.thread_ts.clone()),
-                )
-                .await;
-        }
     }
 
     let timeout_budget_secs =
@@ -1722,6 +1709,27 @@ async fn process_channel_message(
             async {
                 if msg.channel == "imessage" {
                     if let Some(engine) = ctx.task_engine.as_ref() {
+                        let progress_reporter: Option<crate::agent::task_engine::TaskProgressReporter> =
+                            target_channel.as_ref().map(|channel| {
+                                let channel = Arc::clone(channel);
+                                let reply_target = msg.reply_target.clone();
+                                let thread_ts = msg.thread_ts.clone();
+                                let reporter: crate::agent::task_engine::TaskProgressReporter =
+                                    Arc::new(move |progress: String| {
+                                        let channel = Arc::clone(&channel);
+                                        let reply_target = reply_target.clone();
+                                        let thread_ts = thread_ts.clone();
+                                        tokio::spawn(async move {
+                                            let _ = channel
+                                            .send(
+                                                &SendMessage::new(progress, &reply_target)
+                                                    .in_thread(thread_ts),
+                                            )
+                                            .await;
+                                        });
+                                    });
+                                reporter
+                            });
                         let req = crate::agent::task_engine::TaskRunRequest {
                             channel: msg.channel.as_str(),
                             sender_key: msg.sender.as_str(),
@@ -1744,13 +1752,13 @@ async fn process_channel_message(
                             } else {
                                 ctx.non_cli_excluded_tools.as_ref()
                             },
+                            progress_reporter,
                         };
                         let outcome =
                             crate::agent::task_engine::TaskEngine::run_task(req, engine.as_ref())
                                 .await?;
                         return Ok(ChannelLlmOutcome {
                             response: outcome.final_response,
-                            write_verified: outcome.write_verified,
                         });
                     }
                 }
@@ -1780,7 +1788,6 @@ async fn process_channel_message(
                 .await?;
                 Ok(ChannelLlmOutcome {
                     response,
-                    write_verified: false,
                 })
             },
         ) => LlmExecutionResult::Completed(result),
@@ -1831,16 +1838,6 @@ async fn process_channel_message(
             }
         }
         LlmExecutionResult::Completed(Ok(Ok(outcome))) => {
-            if outcome.write_verified {
-                if let Some(channel) = target_channel.as_ref() {
-                    let _ = channel
-                        .send(
-                            &SendMessage::new("✅ 文件写入已完成校验。", &msg.reply_target)
-                                .in_thread(msg.thread_ts.clone()),
-                        )
-                        .await;
-                }
-            }
             // ── Hook: on_message_sending (modifying) ─────────
             let mut outbound_response = outcome.response;
             if let Some(hooks) = &ctx.hooks {
@@ -4664,9 +4661,17 @@ BTC is currently around $65,000 based on latest tool output."#
         .await;
 
         let sent = channel_impl.sent_messages.lock().await;
-        assert_eq!(sent.len(), 2);
-        assert!(sent[0].contains("🧠 已接管任务并开始执行。"));
-        assert!(sent[1].contains("任务已完成。"));
+        assert!(
+            sent.len() >= 5,
+            "expected round-by-round progress notifications, got: {sent:?}"
+        );
+        assert!(sent
+            .iter()
+            .any(|m| m.contains("任务已接管，进入自主执行模式")));
+        assert!(sent.iter().any(|m| m.contains("第 1/4 轮执行中")));
+        assert!(sent.iter().any(|m| m.contains("第 1 轮尚未完成")));
+        assert!(sent.iter().any(|m| m.contains("任务完成（第 2 轮）")));
+        assert!(sent.iter().any(|m| m.contains("任务已完成。")));
         drop(sent);
 
         assert_eq!(provider_impl.call_count.load(Ordering::SeqCst), 2);
