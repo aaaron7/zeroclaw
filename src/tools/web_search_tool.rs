@@ -5,7 +5,7 @@ use serde_json::json;
 use std::time::Duration;
 
 /// Web search tool for searching the internet.
-/// Supports multiple providers: DuckDuckGo (free), Brave (requires API key).
+/// Supports multiple providers: DuckDuckGo (free), Bing (free), Brave (requires API key).
 pub struct WebSearchTool {
     provider: String,
     brave_api_key: Option<String>,
@@ -129,6 +129,28 @@ impl WebSearchTool {
         self.parse_brave_results(&json, query)
     }
 
+    async fn search_bing(&self, query: &str) -> anyhow::Result<String> {
+        let encoded_query = urlencoding::encode(query);
+        let search_url = format!(
+            "https://www.bing.com/search?q={}&count={}",
+            encoded_query, self.max_results
+        );
+
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(self.timeout_secs))
+            .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+            .build()?;
+
+        let response = client.get(&search_url).send().await?;
+
+        if !response.status().is_success() {
+            anyhow::bail!("Bing search failed with status: {}", response.status());
+        }
+
+        let html = response.text().await?;
+        self.parse_bing_results(&html, query)
+    }
+
     fn parse_brave_results(&self, json: &serde_json::Value, query: &str) -> anyhow::Result<String> {
         let results = json
             .get("web")
@@ -158,6 +180,55 @@ impl WebSearchTool {
             if !description.is_empty() {
                 lines.push(format!("   {}", description));
             }
+        }
+
+        Ok(lines.join("\n"))
+    }
+
+    fn parse_bing_results(&self, html: &str, query: &str) -> anyhow::Result<String> {
+        // Extract item blocks from Bing result list.
+        let item_regex =
+            Regex::new(r#"<li[^>]*class="[^"]*\bb_algo\b[^"]*"[^>]*>([\s\S]*?)</li>"#)?;
+        // Extract top link from each block.
+        let link_regex = Regex::new(r#"<a[^>]*href="(https?://[^"]+)"[^>]*>([\s\S]*?)</a>"#)?;
+        // Extract first snippet paragraph if available.
+        let snippet_regex = Regex::new(r#"<p[^>]*>([\s\S]*?)</p>"#)?;
+
+        let mut lines = vec![format!("Search results for: {} (via Bing)", query)];
+        let mut found = 0;
+
+        for block_caps in item_regex.captures_iter(html) {
+            if found >= self.max_results {
+                break;
+            }
+
+            let block = &block_caps[1];
+            let Some(link_caps) = link_regex.captures(block) else {
+                continue;
+            };
+
+            let title = strip_tags(&link_caps[2]);
+            let title = title.trim();
+            if title.is_empty() {
+                continue;
+            }
+
+            let url = link_caps[1].replace("&amp;", "&");
+            found += 1;
+            lines.push(format!("{}. {}", found, title));
+            lines.push(format!("   {}", url.trim()));
+
+            if let Some(snippet_caps) = snippet_regex.captures(block) {
+                let snippet = strip_tags(&snippet_caps[1]);
+                let snippet = snippet.trim();
+                if !snippet.is_empty() {
+                    lines.push(format!("   {}", snippet));
+                }
+            }
+        }
+
+        if found == 0 {
+            return Ok(format!("No results found for: {}", query));
         }
 
         Ok(lines.join("\n"))
@@ -218,9 +289,10 @@ impl Tool for WebSearchTool {
 
         let result = match self.provider.as_str() {
             "duckduckgo" | "ddg" => self.search_duckduckgo(query).await?,
+            "bing" => self.search_bing(query).await?,
             "brave" => self.search_brave(query).await?,
             _ => anyhow::bail!(
-                "Unknown search provider: '{}'. Set tools.web_search.provider to 'duckduckgo' or 'brave' in config.toml",
+                "Unknown search provider: '{}'. Set tools.web_search.provider to 'duckduckgo', 'bing', or 'brave' in config.toml",
                 self.provider
             ),
         };
@@ -297,6 +369,43 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_bing_results_empty() {
+        let tool = WebSearchTool::new("bing".to_string(), None, 5, 15);
+        let result = tool
+            .parse_bing_results("<html>No results here</html>", "test")
+            .unwrap();
+        assert!(result.contains("No results found"));
+    }
+
+    #[test]
+    fn test_parse_bing_results_with_data() {
+        let tool = WebSearchTool::new("bing".to_string(), None, 5, 15);
+        let html = r#"
+            <li class="b_algo">
+                <h2><a href="https://example.com/path?a=1&amp;b=2">Example Title</a></h2>
+                <div class="b_caption"><p>This is a description</p></div>
+            </li>
+        "#;
+        let result = tool.parse_bing_results(html, "test").unwrap();
+        assert!(result.contains("Example Title"));
+        assert!(result.contains("https://example.com/path?a=1&b=2"));
+        assert!(result.contains("This is a description"));
+    }
+
+    #[test]
+    fn test_parse_bing_results_skips_non_http_urls() {
+        let tool = WebSearchTool::new("bing".to_string(), None, 5, 15);
+        let html = r#"
+            <li class="b_algo">
+                <h2><a href="/search?q=internal">Internal</a></h2>
+                <div class="b_caption"><p>Should be ignored</p></div>
+            </li>
+        "#;
+        let result = tool.parse_bing_results(html, "test").unwrap();
+        assert!(result.contains("No results found"));
+    }
+
+    #[test]
     fn test_constructor_clamps_web_search_limits() {
         let tool = WebSearchTool::new("duckduckgo".to_string(), None, 0, 0);
         let html = r#"
@@ -327,5 +436,16 @@ mod tests {
         let result = tool.execute(json!({"query": "test"})).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("API key"));
+    }
+
+    #[tokio::test]
+    async fn test_execute_unknown_provider_lists_bing() {
+        let tool = WebSearchTool::new("unknown-provider".to_string(), None, 5, 15);
+        let result = tool.execute(json!({"query": "test"})).await;
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("'duckduckgo', 'bing', or 'brave'"));
     }
 }

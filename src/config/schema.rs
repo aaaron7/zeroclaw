@@ -1028,7 +1028,7 @@ pub struct WebSearchConfig {
     /// Enable `web_search_tool` for web searches
     #[serde(default)]
     pub enabled: bool,
-    /// Search provider: "duckduckgo" (free, no API key) or "brave" (requires API key)
+    /// Search provider: "duckduckgo" (free), "bing" (free), or "brave" (requires API key)
     #[serde(default = "default_web_search_provider")]
     pub provider: String,
     /// Brave Search API key (required if provider is "brave")

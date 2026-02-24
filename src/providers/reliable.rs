@@ -20,6 +20,30 @@ fn is_non_retryable(err: &anyhow::Error) -> bool {
         return true;
     }
 
+    let msg = err.to_string();
+    let msg_lower = msg.to_lowercase();
+
+    // Transport-layer failures are transient by nature and should stay retryable,
+    // even when wrapped fallback payloads embed 4xx-like numeric codes.
+    let transport_retryable_hints = [
+        "transport error",
+        "error sending request for url",
+        "connection reset",
+        "connection refused",
+        "failed to connect",
+        "dns error",
+        "request timed out",
+        "timed out",
+        "tls handshake",
+        "network unreachable",
+    ];
+    if transport_retryable_hints
+        .iter()
+        .any(|hint| msg_lower.contains(hint))
+    {
+        return false;
+    }
+
     // 4xx errors are generally non-retryable (bad request, auth failure, etc.),
     // except 429 (rate-limit — transient) and 408 (timeout — worth retrying).
     if let Some(reqwest_err) = err.downcast_ref::<reqwest::Error>() {
@@ -30,7 +54,6 @@ fn is_non_retryable(err: &anyhow::Error) -> bool {
     }
     // Fallback: parse status codes from stringified errors (some providers
     // embed codes in error messages rather than returning typed HTTP errors).
-    let msg = err.to_string();
     for word in msg.split(|c: char| !c.is_ascii_digit()) {
         if let Ok(code) = word.parse::<u16>() {
             if (400..500).contains(&code) {
@@ -41,7 +64,6 @@ fn is_non_retryable(err: &anyhow::Error) -> bool {
 
     // Heuristic: detect auth/model failures by keyword when no HTTP status
     // is available (e.g. gRPC or custom transport errors).
-    let msg_lower = msg.to_lowercase();
     let auth_failure_hints = [
         "invalid api key",
         "incorrect api key",
@@ -1074,6 +1096,17 @@ mod tests {
         assert!(is_non_retryable(&anyhow::anyhow!(
             "OpenAI Codex stream error: Your input exceeds the context window of this model."
         )));
+    }
+
+    #[test]
+    fn non_retryable_does_not_flag_transport_error_wrapped_with_fallback_4xx() {
+        let err = anyhow::anyhow!(
+            "Custom native chat transport error: error sending request for url (https://apis.iflow.cn/v1/chat/completions) (responses fallback failed: Custom Responses API error: {{\"error\":{{\"code\":400,\"message\":\"bad request\"}}}})"
+        );
+        assert!(
+            !is_non_retryable(&err),
+            "transport-layer failures should remain retryable even when fallback payload includes 4xx-style codes"
+        );
     }
 
     #[tokio::test]

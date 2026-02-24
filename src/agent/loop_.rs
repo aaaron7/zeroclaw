@@ -122,6 +122,253 @@ fn truncate_tool_args_for_progress(name: &str, args: &serde_json::Value, max_len
     }
 }
 
+fn looks_like_filesystem_write_claim(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    let chinese_claim_hints = [
+        "已写入",
+        "已经写入",
+        "写到了",
+        "已保存",
+        "已经保存",
+        "保存到",
+        "保存在",
+        "保存于",
+        "已存储",
+        "已经存储",
+        "存储到",
+        "已创建",
+        "已经创建",
+        "成功创建",
+        "已成功创建",
+        "文件已成功创建",
+        "已生成",
+        "已经生成",
+        "已更新",
+        "已经更新",
+    ];
+
+    let completion_verbs = [
+        "i wrote",
+        "written to",
+        "saved to",
+        "saved as",
+        "has been saved",
+        "has been written",
+        "created at",
+        "created the file",
+        "updated the file",
+        "generated the report",
+        "i updated",
+        "i created",
+        "i saved",
+    ];
+
+    let file_indicators = [
+        "/", "\\", ".md", ".txt", ".rs", ".json", ".yaml", ".yml", ".toml", " file ", " path ",
+        "docs/", "src/",
+    ];
+
+    let chinese_non_completion_hints = [
+        "如果你需要",
+        "如果需要",
+        "如果想要",
+        "建议",
+        "可以",
+        "可",
+        "将",
+        "将会",
+        "会",
+    ];
+
+    let has_chinese_non_completion = chinese_non_completion_hints
+        .iter()
+        .any(|hint| text.contains(hint))
+        && !text.contains("已经")
+        && !text.contains("已")
+        && !text.contains("成功");
+    if chinese_claim_hints.iter().any(|hint| text.contains(hint)) && !has_chinese_non_completion {
+        return true;
+    }
+
+    let non_completion_hints = [
+        "can write",
+        "could write",
+        "will write",
+        "would write",
+        "can be saved as",
+        "could be saved as",
+        "will be saved as",
+        "would be saved as",
+        "if you want",
+        "if needed",
+        "if you need",
+    ];
+
+    completion_verbs.iter().any(|hint| lower.contains(hint))
+        && file_indicators.iter().any(|hint| lower.contains(hint))
+        && !non_completion_hints.iter().any(|hint| lower.contains(hint))
+        && !has_chinese_non_completion
+}
+
+fn shell_command_likely_writes_files(command: &str) -> bool {
+    let lower = command.to_lowercase();
+
+    if lower.contains(">>")
+        || lower.contains(" > ")
+        || lower.contains("\n>")
+        || lower.contains("tee ")
+    {
+        return true;
+    }
+
+    let mutating_hints = [
+        "touch ",
+        "mkdir ",
+        "cp ",
+        "mv ",
+        "rm ",
+        "truncate ",
+        "install ",
+        "ln ",
+        "sed -i",
+        "perl -i",
+        "git apply",
+        "patch ",
+    ];
+
+    mutating_hints.iter().any(|hint| lower.contains(hint))
+}
+
+fn shell_command_likely_reads_files(command: &str) -> bool {
+    if shell_command_likely_writes_files(command) {
+        return false;
+    }
+
+    let lower = command.to_lowercase();
+    let read_hints = [
+        "cat ", "less ", "more ", "head ", "tail ", "wc ", "stat ", "ls ", "find ", "rg ", "grep ",
+        "sed -n", "nl ",
+    ];
+
+    read_hints.iter().any(|hint| lower.contains(hint))
+}
+
+fn tool_call_indicates_filesystem_write(call: &ParsedToolCall) -> bool {
+    match call.name.as_str() {
+        "file_write" => true,
+        "shell" => call
+            .arguments
+            .get("command")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(shell_command_likely_writes_files),
+        _ => false,
+    }
+}
+
+fn tool_call_indicates_filesystem_read(call: &ParsedToolCall) -> bool {
+    match call.name.as_str() {
+        "file_read" => true,
+        "shell" => call
+            .arguments
+            .get("command")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(shell_command_likely_reads_files),
+        _ => false,
+    }
+}
+
+fn contains_cjk(text: &str) -> bool {
+    text.chars().any(|ch| {
+        matches!(
+            ch,
+            '\u{3400}'..='\u{4DBF}'
+                | '\u{4E00}'..='\u{9FFF}'
+                | '\u{F900}'..='\u{FAFF}'
+                | '\u{20000}'..='\u{2A6DF}'
+                | '\u{2A700}'..='\u{2B73F}'
+                | '\u{2B740}'..='\u{2B81F}'
+                | '\u{2B820}'..='\u{2CEAF}'
+                | '\u{2CEB0}'..='\u{2EBEF}'
+        )
+    })
+}
+
+fn user_prefers_chinese_response(history: &[ChatMessage]) -> bool {
+    for msg in history.iter().rev() {
+        if msg.role != "user" {
+            continue;
+        }
+        let content = msg.content.trim();
+        if content.is_empty() {
+            continue;
+        }
+
+        let lower = content.to_lowercase();
+        let explicitly_english = lower.contains("in english")
+            || lower.contains("english only")
+            || content.contains("用英文")
+            || content.contains("英文回复");
+        if explicitly_english {
+            return false;
+        }
+
+        return contains_cjk(content);
+    }
+    false
+}
+
+fn response_contains_chinese(text: &str) -> bool {
+    contains_cjk(text)
+}
+
+fn looks_like_premature_pause_request(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    let completion_hints = [
+        "done",
+        "completed",
+        "finished",
+        "successfully",
+        "已完成",
+        "已经完成",
+        "完成了",
+        "已写入",
+        "已经写入",
+        "已保存",
+        "已经保存",
+        "成功创建",
+        "已生成",
+        "已经生成",
+        "已更新",
+        "已经更新",
+    ];
+    if completion_hints
+        .iter()
+        .any(|hint| lower.contains(hint) || text.contains(hint))
+    {
+        return false;
+    }
+
+    let pause_hints = [
+        "would you like me",
+        "do you want me to continue",
+        "if you'd like",
+        "if you want, i can continue",
+        "let me know if you want",
+        "reply continue",
+        "需要我继续",
+        "要我继续",
+        "要不要我继续",
+        "是否需要我继续",
+        "如需我可以继续",
+        "如果你需要，我可以继续",
+        "回复 continue",
+    ];
+
+    pause_hints
+        .iter()
+        .any(|hint| lower.contains(hint) || text.contains(hint))
+}
+
 /// Convert a tool registry to OpenAI function-calling format for native tool support.
 fn tools_to_openai_format(tools_registry: &[Box<dyn Tool>]) -> Vec<serde_json::Value> {
     tools_registry
@@ -2024,6 +2271,12 @@ pub(crate) async fn run_tool_call_loop(
     let use_native_tools = provider.supports_native_tools() && !tool_specs.is_empty();
     let turn_id = Uuid::new_v4().to_string();
     let mut seen_tool_signatures: HashSet<(String, String)> = HashSet::new();
+    let mut saw_verified_filesystem_write = false;
+    let mut pending_post_write_read_verification = false;
+    let mut write_claim_guard_triggered = false;
+    let mut language_guard_triggered = false;
+    let mut autonomy_guard_triggered = false;
+    let mut saw_any_tool_execution = false;
 
     for iteration in 0..max_iterations {
         if cancellation_token
@@ -2263,6 +2516,104 @@ pub(crate) async fn run_tool_call_loop(
         }
 
         if tool_calls.is_empty() {
+            let prefer_chinese = user_prefers_chinese_response(history);
+
+            if prefer_chinese
+                && !display_text.trim().is_empty()
+                && !response_contains_chinese(&display_text)
+            {
+                tracing::warn!(
+                    provider = provider_name,
+                    model = model,
+                    "Guardrail blocked non-Chinese final response for Chinese user input"
+                );
+
+                if language_guard_triggered {
+                    anyhow::bail!(
+                        "Guardrail: response language mismatch persisted after correction request"
+                    );
+                }
+
+                language_guard_triggered = true;
+                history.push(ChatMessage::assistant(response_text.clone()));
+                history.push(ChatMessage::user(
+                    "[Language Guard]\n\
+                     用户上一条请求是中文。请用中文继续完成任务并给出最终答复。\n\
+                     除非用户明确要求英文，否则不要切换到英文。",
+                ));
+                continue;
+            }
+
+            if looks_like_filesystem_write_claim(&display_text)
+                && (!saw_verified_filesystem_write || pending_post_write_read_verification)
+            {
+                tracing::warn!(
+                    provider = provider_name,
+                    model = model,
+                    "Guardrail blocked unverified filesystem-write completion claim"
+                );
+
+                if write_claim_guard_triggered {
+                    anyhow::bail!(
+                        "Guardrail: model claimed filesystem write completion without verified write tool execution"
+                    );
+                }
+
+                write_claim_guard_triggered = true;
+                history.push(ChatMessage::assistant(response_text.clone()));
+                if prefer_chinese {
+                    history.push(ChatMessage::user(
+                        "[Verification Guard]\n\
+                         你上一条回复声称已完成文件写入，但缺少写后校验证据。\n\
+                         在最终回复前请完成以下之一：\n\
+                         1) 重新检查目标文件，并在写入后使用 file_read 或 shell（`ls`/`wc`/`cat`）验证，再报告证据。\n\
+                         2) 明确说明文件/报告尚未写入完成。",
+                    ));
+                } else {
+                    history.push(ChatMessage::user(
+                        "[Verification Guard]\n\
+                         Your previous response claimed filesystem write completion, but no verified \
+                         post-write evidence is available.\n\
+                         Before finalizing, do one of:\n\
+                         1) Execute or re-check the target file and verify with file_read or shell \
+                         (`ls`/`wc`/`cat`) AFTER the write step, then report evidence.\n\
+                         2) Explicitly state that no file/report has been written yet.",
+                    ));
+                }
+                continue;
+            }
+
+            if saw_any_tool_execution && looks_like_premature_pause_request(&display_text) {
+                tracing::warn!(
+                    provider = provider_name,
+                    model = model,
+                    "Guardrail blocked premature pause before completing task"
+                );
+
+                if autonomy_guard_triggered {
+                    anyhow::bail!("Guardrail: model paused before completing requested task");
+                }
+
+                autonomy_guard_triggered = true;
+                history.push(ChatMessage::assistant(response_text.clone()));
+                if prefer_chinese {
+                    history.push(ChatMessage::user(
+                        "[Autonomy Guard]\n\
+                         任务尚未明确完成时，不要要求用户再发“继续”或额外确认。\n\
+                         请继续自主执行，直到完成原始请求再给出最终结果。\n\
+                         只有在确实缺少必要信息或权限时，才向用户提问。",
+                    ));
+                } else {
+                    history.push(ChatMessage::user(
+                        "[Autonomy Guard]\n\
+                         Do not ask the user to send \"continue\" or extra confirmation before the task is complete.\n\
+                         Keep working autonomously until the original request is completed, then provide the final result.\n\
+                         Ask the user only when essential information or permissions are truly missing.",
+                    ));
+                }
+                continue;
+            }
+
             runtime_trace::record_event(
                 "turn_final_response",
                 Some(channel_name),
@@ -2510,6 +2861,25 @@ pub(crate) async fn run_tool_call_loop(
             .zip(executable_calls.iter())
             .zip(executed_outcomes.into_iter())
         {
+            saw_any_tool_execution = true;
+            if outcome.success && tool_call_indicates_filesystem_write(call) {
+                saw_verified_filesystem_write = true;
+                pending_post_write_read_verification = true;
+            }
+            if outcome.success
+                && pending_post_write_read_verification
+                && tool_call_indicates_filesystem_read(call)
+            {
+                pending_post_write_read_verification = false;
+            }
+            if !outcome.success && tool_call_indicates_filesystem_write(call) {
+                tracing::warn!(
+                    tool = %call.name,
+                    reason = %outcome.error_reason.as_deref().unwrap_or("unknown"),
+                    "Filesystem write-like tool call failed"
+                );
+            }
+
             runtime_trace::record_event(
                 "tool_call_result",
                 Some(channel_name),
@@ -3716,6 +4086,251 @@ mod tests {
 
         assert_eq!(result, "vision-ok");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_blocks_unverified_filesystem_write_claims() {
+        let provider = ScriptedProvider::from_text_responses(vec![
+            "I wrote the report to docs/report.md.",
+            "I wrote the report to docs/report.md.",
+        ]);
+
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("please write the report"),
+        ];
+        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let observer = NoopObserver;
+
+        let err = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "cli",
+            &crate::config::MultimodalConfig::default(),
+            4,
+            None,
+            None,
+            None,
+            &[],
+        )
+        .await
+        .expect_err("guardrail should block repeated unverified write claims");
+
+        assert!(err.to_string().contains("Guardrail"));
+        assert!(
+            history
+                .iter()
+                .any(|msg| msg.content.contains("[Verification Guard]")),
+            "guardrail should inject verification instruction into history"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_blocks_write_claim_without_post_write_read_verification() {
+        let provider = ScriptedProvider::from_text_responses(vec![
+            r#"<tool_call>
+{"name":"file_write","arguments":{"value":"A"}}
+</tool_call>"#,
+            "I wrote the report to docs/report.md.",
+            "I wrote the report to docs/report.md.",
+        ]);
+
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(CountingTool::new(
+            "file_write",
+            Arc::clone(&invocations),
+        ))];
+
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("please write the report"),
+        ];
+        let observer = NoopObserver;
+
+        let err = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "cli",
+            &crate::config::MultimodalConfig::default(),
+            4,
+            None,
+            None,
+            None,
+            &[],
+        )
+        .await
+        .expect_err("write claim should be blocked without post-write read verification");
+
+        assert!(err.to_string().contains("Guardrail"));
+        assert_eq!(invocations.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_allows_write_claim_after_post_write_read_verification() {
+        let provider = ScriptedProvider::from_text_responses(vec![
+            r#"<tool_call>
+{"name":"file_write","arguments":{"value":"A"}}
+</tool_call>"#,
+            r#"<tool_call>
+{"name":"file_read","arguments":{"value":"A"}}
+</tool_call>"#,
+            "I wrote the report to docs/report.md.",
+        ]);
+
+        let write_invocations = Arc::new(AtomicUsize::new(0));
+        let read_invocations = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![
+            Box::new(CountingTool::new(
+                "file_write",
+                Arc::clone(&write_invocations),
+            )),
+            Box::new(CountingTool::new(
+                "file_read",
+                Arc::clone(&read_invocations),
+            )),
+        ];
+
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("please write the report"),
+        ];
+        let observer = NoopObserver;
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "cli",
+            &crate::config::MultimodalConfig::default(),
+            5,
+            None,
+            None,
+            None,
+            &[],
+        )
+        .await
+        .expect("write claim should pass after post-write read verification");
+
+        assert_eq!(result, "I wrote the report to docs/report.md.");
+        assert_eq!(write_invocations.load(Ordering::SeqCst), 1);
+        assert_eq!(read_invocations.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_blocks_non_chinese_final_response_for_chinese_user() {
+        let provider = ScriptedProvider::from_text_responses(vec![
+            "I have completed the report.",
+            "I have completed the report.",
+        ]);
+
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("请总结这个报告"),
+        ];
+        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let observer = NoopObserver;
+
+        let err = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "cli",
+            &crate::config::MultimodalConfig::default(),
+            4,
+            None,
+            None,
+            None,
+            &[],
+        )
+        .await
+        .expect_err("language guard should block repeated non-Chinese output");
+
+        assert!(err.to_string().contains("language mismatch"));
+        assert!(
+            history
+                .iter()
+                .any(|msg| msg.content.contains("[Language Guard]")),
+            "language guard should inject correction instruction into history"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_blocks_premature_pause_before_completion() {
+        let provider = ScriptedProvider::from_text_responses(vec![
+            r#"<tool_call>
+{"name":"file_read","arguments":{"value":"A"}}
+</tool_call>"#,
+            "If you'd like, I can continue expanding the report.",
+            "If you'd like, I can continue expanding the report.",
+        ]);
+
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(CountingTool::new(
+            "file_read",
+            Arc::clone(&invocations),
+        ))];
+
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("please finish the report"),
+        ];
+        let observer = NoopObserver;
+
+        let err = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "cli",
+            &crate::config::MultimodalConfig::default(),
+            5,
+            None,
+            None,
+            None,
+            &[],
+        )
+        .await
+        .expect_err("autonomy guard should block repeated premature pause");
+
+        assert!(err.to_string().contains("paused before completing"));
+        assert_eq!(invocations.load(Ordering::SeqCst), 1);
+        assert!(
+            history
+                .iter()
+                .any(|msg| msg.content.contains("[Autonomy Guard]")),
+            "autonomy guard should inject continuation instruction into history"
+        );
     }
 
     #[test]
@@ -5102,6 +5717,101 @@ Let me check the result."#;
         assert_eq!(history.len(), 3); // system + 2 kept
         assert_eq!(history[0].role, "system");
         assert_eq!(history[1].content, "new msg");
+    }
+
+    #[test]
+    fn filesystem_write_claim_detection_catches_english_and_chinese_claims() {
+        assert!(looks_like_filesystem_write_claim(
+            "I wrote the report to docs/report.md and updated the file."
+        ));
+        assert!(looks_like_filesystem_write_claim(
+            "报告已经写入到 docs/report.md 了。"
+        ));
+        assert!(looks_like_filesystem_write_claim(
+            "The updated report has been saved as `AIGC_AI_Image_Generation_Market_Research_Report_2025.md` in your workspace."
+        ));
+        assert!(looks_like_filesystem_write_claim(
+            "好的，我已经将这份中国ADHD儿童调查报告保存到工作空间中。文件已成功创建：`中国ADHD儿童调查报告.md`"
+        ));
+    }
+
+    #[test]
+    fn filesystem_write_claim_detection_ignores_non_completion_text() {
+        assert!(!looks_like_filesystem_write_claim(
+            "I can write a report to docs/report.md if you want."
+        ));
+        assert!(!looks_like_filesystem_write_claim(
+            "建议把结果保存到 docs/report.md。"
+        ));
+        assert!(!looks_like_filesystem_write_claim(
+            "This can be saved as docs/report.md if you want."
+        ));
+        assert!(!looks_like_filesystem_write_claim(
+            "如果你需要，我可以把报告保存到工作空间中。"
+        ));
+    }
+
+    #[test]
+    fn user_prefers_chinese_response_detects_chinese_latest_user_turn() {
+        let history = vec![
+            ChatMessage::system("system"),
+            ChatMessage::user("请帮我写一份报告"),
+            ChatMessage::assistant("ok"),
+        ];
+        assert!(user_prefers_chinese_response(&history));
+    }
+
+    #[test]
+    fn user_prefers_chinese_response_respects_explicit_english_request() {
+        let history = vec![
+            ChatMessage::system("system"),
+            ChatMessage::user("请用英文回答 in English"),
+        ];
+        assert!(!user_prefers_chinese_response(&history));
+    }
+
+    #[test]
+    fn premature_pause_detection_distinguishes_incomplete_vs_complete() {
+        assert!(looks_like_premature_pause_request(
+            "If you'd like, I can continue expanding the report."
+        ));
+        assert!(looks_like_premature_pause_request(
+            "如果你需要，我可以继续补充。"
+        ));
+        assert!(!looks_like_premature_pause_request(
+            "I completed the report successfully. Let me know if you want edits."
+        ));
+        assert!(!looks_like_premature_pause_request(
+            "报告已完成，如果你需要我可以再修改。"
+        ));
+    }
+
+    #[test]
+    fn shell_write_detection_identifies_mutating_commands() {
+        assert!(shell_command_likely_writes_files("touch report.md"));
+        assert!(shell_command_likely_writes_files(
+            "echo hello > docs/report.md"
+        ));
+    }
+
+    #[test]
+    fn shell_write_detection_ignores_read_only_commands() {
+        assert!(!shell_command_likely_writes_files("ls -la"));
+        assert!(!shell_command_likely_writes_files("cat docs/report.md"));
+    }
+
+    #[test]
+    fn shell_read_detection_identifies_read_only_commands() {
+        assert!(shell_command_likely_reads_files("cat docs/report.md"));
+        assert!(shell_command_likely_reads_files("ls -la"));
+    }
+
+    #[test]
+    fn shell_read_detection_ignores_mutating_commands() {
+        assert!(!shell_command_likely_reads_files(
+            "echo hello > docs/report.md"
+        ));
+        assert!(!shell_command_likely_reads_files("touch docs/report.md"));
     }
 
     /// When `build_system_prompt_with_mode` is called with `native_tools = true`,
