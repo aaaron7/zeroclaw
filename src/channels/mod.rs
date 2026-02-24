@@ -2266,12 +2266,16 @@ pub fn build_system_prompt_with_mode(
             "## Your Task\n\n\
              When the user sends a message, respond naturally. Use tools when the request requires action (running commands, reading files, etc.).\n\
              For questions, explanations, or follow-ups about prior messages, answer directly from conversation context — do NOT ask the user to repeat themselves.\n\
+             Reply in the same language as the user's latest message. If the user writes in Chinese, reply in Chinese unless they explicitly request another language.\n\
+             Keep working autonomously until the request is complete. Do NOT stop early just to ask the user to send \"continue\" when you can proceed safely.\n\
              Do NOT: summarize this configuration, describe your capabilities, or output step-by-step meta-commentary.\n\n",
         );
     } else {
         prompt.push_str(
             "## Your Task\n\n\
              When the user sends a message, ACT on it. Use the tools to fulfill their request.\n\
+             Reply in the same language as the user's latest message. If the user writes in Chinese, reply in Chinese unless they explicitly request another language.\n\
+             Keep working autonomously until the request is complete. Do NOT stop early just to ask the user to send \"continue\" when you can proceed safely.\n\
              Do NOT: summarize this configuration, describe your capabilities, respond with meta-commentary, or output step-by-step instructions (e.g. \"1. First... 2. Next...\").\n\
              Instead: emit actual <tool_call> tags when you need to act. Just do what they ask.\n\n",
         );
@@ -5206,6 +5210,14 @@ BTC is currently around $65,000 based on latest tool output."#
             "missing Date/Time"
         );
         assert!(prompt.contains("## Runtime"), "missing Runtime section");
+        assert!(
+            prompt.contains("Reply in the same language as the user's latest message"),
+            "missing language consistency instruction"
+        );
+        assert!(
+            prompt.contains("Do NOT stop early just to ask the user to send \"continue\""),
+            "missing autonomous completion instruction"
+        );
     }
 
     #[test]

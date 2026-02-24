@@ -1040,24 +1040,30 @@ impl OpenAiCompatibleProvider {
     }
 
     fn is_native_tool_schema_unsupported(status: reqwest::StatusCode, error: &str) -> bool {
-        if !matches!(
-            status,
-            reqwest::StatusCode::BAD_REQUEST | reqwest::StatusCode::UNPROCESSABLE_ENTITY
-        ) {
-            return false;
-        }
-
         let lower = error.to_lowercase();
-        [
+
+        let explicit_tool_hints = [
             "unknown parameter: tools",
             "unsupported parameter: tools",
             "unrecognized field `tools`",
             "does not support tools",
             "function calling is not supported",
             "tool_choice",
-        ]
-        .iter()
-        .any(|hint| lower.contains(hint))
+        ];
+
+        if matches!(
+            status,
+            reqwest::StatusCode::BAD_REQUEST | reqwest::StatusCode::UNPROCESSABLE_ENTITY
+        ) && explicit_tool_hints.iter().any(|hint| lower.contains(hint))
+        {
+            return true;
+        }
+
+        // Some OpenAI-compatible gateways return non-standard 5xx (e.g. 516)
+        // when native tool payloads trigger internal JSON-mapper failures.
+        status.is_server_error()
+            && lower.contains("json mapper error")
+            && lower.contains("unrecognized token")
     }
 }
 
@@ -2449,6 +2455,14 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("TestProvider API key not set"));
+    }
+
+    #[test]
+    fn native_tool_schema_unsupported_detects_custom_516_json_mapper_error() {
+        assert!(OpenAiCompatibleProvider::is_native_tool_schema_unsupported(
+            reqwest::StatusCode::from_u16(516).expect("valid custom status"),
+            "Engine unexpected error!: inference failed, msg=Json mapper error!: msg=Unrecognized token 'Internal'"
+        ));
     }
 
     #[test]
