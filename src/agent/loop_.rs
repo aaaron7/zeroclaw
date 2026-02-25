@@ -369,6 +369,137 @@ fn looks_like_premature_pause_request(text: &str) -> bool {
         .any(|hint| lower.contains(hint) || text.contains(hint))
 }
 
+fn user_requested_filesystem_inspection(history: &[ChatMessage]) -> bool {
+    for msg in history.iter().rev() {
+        if msg.role != "user" {
+            continue;
+        }
+        let content = msg.content.trim();
+        if content.is_empty() {
+            continue;
+        }
+
+        let lower = content.to_lowercase();
+        let inspection_hints = [
+            "analy",
+            "inspect",
+            "review",
+            "check",
+            "look at",
+            "repo",
+            "repository",
+            "project",
+            "directory",
+            "folder",
+            "file",
+            "tree",
+            "path",
+            "structure",
+            "分析",
+            "查看",
+            "检查",
+            "看下",
+            "看看",
+            "目录",
+            "文件",
+            "路径",
+            "项目",
+            "工程",
+            "结构",
+            "代码",
+            "仓库",
+        ];
+
+        if inspection_hints.iter().any(|hint| lower.contains(hint))
+            || content.contains('/')
+            || content.contains('\\')
+        {
+            return true;
+        }
+        return false;
+    }
+    false
+}
+
+fn looks_like_filesystem_analysis_claim(text: &str) -> bool {
+    let lower = text.to_lowercase();
+
+    let non_claim_hints = [
+        "cannot access",
+        "can't access",
+        "unable to access",
+        "could not access",
+        "failed to read",
+        "path not allowed",
+        "permission denied",
+        "not accessible",
+        "无法访问",
+        "访问不到",
+        "无法读取",
+        "读取失败",
+        "路径不允许",
+        "没有权限",
+    ];
+    if non_claim_hints
+        .iter()
+        .any(|hint| lower.contains(hint) || text.contains(hint))
+    {
+        return false;
+    }
+
+    let claim_verbs = [
+        "i analyzed",
+        "i reviewed",
+        "i inspected",
+        "i checked",
+        "based on the project",
+        "根据项目",
+        "根据代码",
+        "我分析了",
+        "我查看了",
+        "我检查了",
+        "我看了",
+    ];
+    let structure_hints = [
+        "project structure",
+        "directory structure",
+        "folder structure",
+        "file tree",
+        "codebase contains",
+        "repository contains",
+        "项目结构",
+        "目录结构",
+        "文件结构",
+        "工程结构",
+        "代码结构",
+    ];
+    let artifact_hints = [
+        "src/",
+        "package.json",
+        "node_modules",
+        ".tsx",
+        ".jsx",
+        ".swift",
+        ".xcodeproj",
+        "podfile",
+        ".rs",
+        "cargo.toml",
+    ];
+    let has_tree_markers = text.contains("├──")
+        || text.contains("└──")
+        || text.contains("|--")
+        || text.contains("`--");
+    let has_claim_verb = claim_verbs
+        .iter()
+        .any(|hint| lower.contains(hint) || text.contains(hint));
+    let has_structure_hint = structure_hints
+        .iter()
+        .any(|hint| lower.contains(hint) || text.contains(hint));
+    let has_artifact_hint = artifact_hints.iter().any(|hint| lower.contains(hint));
+
+    has_tree_markers || (has_claim_verb && (has_structure_hint || has_artifact_hint))
+}
+
 /// Convert a tool registry to OpenAI function-calling format for native tool support.
 fn tools_to_openai_format(tools_registry: &[Box<dyn Tool>]) -> Vec<serde_json::Value> {
     tools_registry
@@ -2276,7 +2407,9 @@ pub(crate) async fn run_tool_call_loop(
     let mut write_claim_guard_hits: u32 = 0;
     let mut language_guard_hits: u32 = 0;
     let mut autonomy_guard_hits: u32 = 0;
+    let mut filesystem_analysis_guard_hits: u32 = 0;
     let mut saw_any_tool_execution = false;
+    let mut saw_verified_filesystem_read = false;
 
     for iteration in 0..max_iterations {
         if cancellation_token
@@ -2577,6 +2710,45 @@ pub(crate) async fn run_tool_call_loop(
                 continue;
             }
 
+            let user_requested_fs_inspection = user_requested_filesystem_inspection(history);
+            if user_requested_fs_inspection
+                && looks_like_filesystem_analysis_claim(&display_text)
+                && !saw_verified_filesystem_read
+            {
+                tracing::warn!(
+                    provider = provider_name,
+                    model = model,
+                    "Guardrail blocked unverified filesystem analysis claim"
+                );
+
+                filesystem_analysis_guard_hits = filesystem_analysis_guard_hits.saturating_add(1);
+                history.push(ChatMessage::assistant(response_text.clone()));
+                if prefer_chinese {
+                    history.push(ChatMessage::user(format!(
+                        "[Grounding Guard]\n\
+                         触发原因：你上一条回复给出了目录/项目分析结论，但没有可验证的文件读取证据（第 {} 次）。\n\
+                         在最终答复前请先执行并引用真实结果（例如 file_read，或 shell 的 `ls`/`find`/`cat` 输出）。\n\
+                         如果路径访问被拒绝（例如符号链接指向 workspace 外），请明确说明“无法访问”，并提示用户在 `[autonomy].allowed_roots` 中放行该目录。\n\
+                         禁止在无证据时推测项目类型、目录树或技术栈。",
+                        filesystem_analysis_guard_hits
+                    )));
+                } else {
+                    history.push(ChatMessage::user(format!(
+                        "[Grounding Guard]\n\
+                         Trigger reason: your previous response claimed filesystem/project analysis \
+                         without verifiable read evidence (attempt {}).\n\
+                         Before finalizing, execute and cite real outputs (for example file_read, \
+                         or shell `ls`/`find`/`cat`).\n\
+                         If access is denied (for example symlink target outside workspace), state \
+                         that access is unavailable and instruct the user to allow the directory via \
+                         `[autonomy].allowed_roots`.\n\
+                         Do not infer project type, file tree, or stack without evidence.",
+                        filesystem_analysis_guard_hits
+                    )));
+                }
+                continue;
+            }
+
             if saw_any_tool_execution && looks_like_premature_pause_request(&display_text) {
                 tracing::warn!(
                     provider = provider_name,
@@ -2861,6 +3033,9 @@ pub(crate) async fn run_tool_call_loop(
                 saw_verified_filesystem_write = true;
                 pending_post_write_read_verification = true;
             }
+            if outcome.success && tool_call_indicates_filesystem_read(call) {
+                saw_verified_filesystem_read = true;
+            }
             if outcome.success
                 && pending_post_write_read_verification
                 && tool_call_indicates_filesystem_read(call)
@@ -2964,17 +3139,28 @@ pub(crate) async fn run_tool_call_loop(
         }
     }
 
-    if write_claim_guard_hits > 0 || language_guard_hits > 0 || autonomy_guard_hits > 0 {
+    if write_claim_guard_hits > 0
+        || language_guard_hits > 0
+        || autonomy_guard_hits > 0
+        || filesystem_analysis_guard_hits > 0
+    {
         let prefer_chinese = user_prefers_chinese_response(history);
         let mut reasons: Vec<&str> = Vec::new();
         if write_claim_guard_hits > 0 {
-            reasons.push("文件写入声明缺少可验证证据 / filesystem write claim lacked verifiable evidence");
+            reasons.push(
+                "文件写入声明缺少可验证证据 / filesystem write claim lacked verifiable evidence",
+            );
         }
         if language_guard_hits > 0 {
             reasons.push("回复语言与用户不一致 / response language mismatched user language");
         }
         if autonomy_guard_hits > 0 {
             reasons.push("任务未完成就暂停 / paused before task completion");
+        }
+        if filesystem_analysis_guard_hits > 0 {
+            reasons.push(
+                "目录/项目分析声明缺少可验证读取证据 / filesystem analysis claim lacked verifiable read evidence",
+            );
         }
         let reason_lines = reasons
             .iter()
@@ -2988,6 +3174,7 @@ pub(crate) async fn run_tool_call_loop(
             write_claim_guard_hits,
             language_guard_hits,
             autonomy_guard_hits,
+            filesystem_analysis_guard_hits,
             "Guardrail exhausted max iterations; returning soft-fail notice"
         );
 
@@ -3004,6 +3191,7 @@ pub(crate) async fn run_tool_call_loop(
                 "write_claim_guard_hits": write_claim_guard_hits,
                 "language_guard_hits": language_guard_hits,
                 "autonomy_guard_hits": autonomy_guard_hits,
+                "filesystem_analysis_guard_hits": filesystem_analysis_guard_hits,
             }),
         );
 
@@ -4462,6 +4650,99 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_tool_call_loop_soft_fails_unverified_filesystem_analysis_claims() {
+        let provider = ScriptedProvider::from_text_responses(vec![
+            "I analyzed the project structure and found a React app:\n├── src/\n└── package.json",
+            "I analyzed the project structure and found a React app:\n├── src/\n└── package.json",
+            "I analyzed the project structure and found a React app:\n├── src/\n└── package.json",
+            "I analyzed the project structure and found a React app:\n├── src/\n└── package.json",
+        ]);
+
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("Please inspect the studio directory and analyze the project."),
+        ];
+        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let observer = NoopObserver;
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "cli",
+            &crate::config::MultimodalConfig::default(),
+            4,
+            None,
+            None,
+            None,
+            &[],
+        )
+        .await
+        .expect("grounding guard should return soft-fail notice");
+
+        assert!(result.contains("[Guardrail Notice]"));
+        assert!(result.contains("filesystem analysis claim"));
+        assert!(
+            history
+                .iter()
+                .any(|msg| msg.content.contains("[Grounding Guard]")),
+            "grounding guard should inject verification instruction into history"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_allows_filesystem_analysis_claim_after_read_verification() {
+        let provider = ScriptedProvider::from_text_responses(vec![
+            r#"<tool_call>
+{"name":"file_read","arguments":{"value":"A"}}
+</tool_call>"#,
+            "I analyzed the project structure and found a React app:\n├── src/\n└── package.json",
+        ]);
+
+        let read_invocations = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(CountingTool::new(
+            "file_read",
+            Arc::clone(&read_invocations),
+        ))];
+
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("Please inspect the studio directory and analyze the project."),
+        ];
+        let observer = NoopObserver;
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "cli",
+            &crate::config::MultimodalConfig::default(),
+            4,
+            None,
+            None,
+            None,
+            &[],
+        )
+        .await
+        .expect("analysis claim should pass after read verification");
+
+        assert!(result.contains("I analyzed the project structure"));
+        assert_eq!(read_invocations.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
     async fn run_tool_call_loop_executes_multiple_tools_with_ordered_results() {
         let provider = ScriptedProvider::from_text_responses(vec![
             r#"<tool_call>
@@ -5880,6 +6161,26 @@ Let me check the result."#;
             "echo hello > docs/report.md"
         ));
         assert!(!shell_command_likely_reads_files("touch docs/report.md"));
+    }
+
+    #[test]
+    fn filesystem_analysis_claim_detection_catches_structure_claims() {
+        assert!(looks_like_filesystem_analysis_claim(
+            "I analyzed the project structure:\n├── src/\n└── package.json"
+        ));
+        assert!(looks_like_filesystem_analysis_claim(
+            "我分析了项目结构，包含 src/ 和 Cargo.toml。"
+        ));
+    }
+
+    #[test]
+    fn filesystem_analysis_claim_detection_ignores_access_disclosure() {
+        assert!(!looks_like_filesystem_analysis_claim(
+            "I cannot access that path because it is not allowed."
+        ));
+        assert!(!looks_like_filesystem_analysis_claim(
+            "该路径无法访问，读取失败，请先放开 allowed_roots。"
+        ));
     }
 
     /// When `build_system_prompt_with_mode` is called with `native_tools = true`,
