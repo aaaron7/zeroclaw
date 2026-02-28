@@ -3751,7 +3751,15 @@ pub async fn run(
 
 /// Process a single message through the full agent (with tools, peripherals, memory).
 /// Used by channels (Telegram, Discord, etc.) to enable hardware and tool use.
-pub async fn process_message(config: Config, message: &str) -> Result<String> {
+fn should_use_task_engine_for_channel(channel: &str, config: &Config) -> bool {
+    config.autonomy.contract_completion_engine && matches!(channel, "imessage" | "web_dashboard")
+}
+
+pub async fn process_message_with_channel(
+    config: Config,
+    message: &str,
+    channel: &str,
+) -> Result<String> {
     let observer: Arc<dyn Observer> =
         Arc::from(observability::create_observer(&config.observability));
     let runtime: Arc<dyn runtime::RuntimeAdapter> =
@@ -3915,19 +3923,61 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         ChatMessage::user(&enriched),
     ];
 
-    agent_turn(
-        provider.as_ref(),
-        &mut history,
-        &tools_registry,
-        observer.as_ref(),
-        provider_name,
-        &model_name,
-        config.default_temperature,
-        true,
-        &config.multimodal,
-        config.agent.max_tool_iterations,
-    )
-    .await
+    if should_use_task_engine_for_channel(channel, &config) {
+        let engine_cfg = crate::agent::task_engine::TaskEngineConfig {
+            gray_zone_verifier_enabled: config.autonomy.gray_zone_verifier_enabled,
+            gray_zone_verifier_timeout_ms: config.autonomy.gray_zone_verifier_timeout_ms,
+            ..crate::agent::task_engine::TaskEngineConfig::default()
+        };
+        let engine = crate::agent::task_engine::TaskEngine::new(&config.workspace_dir, engine_cfg)?;
+
+        let excluded_tools: &[String] = if channel == "cli" {
+            &[]
+        } else {
+            config.autonomy.non_cli_excluded_tools.as_slice()
+        };
+
+        let req = crate::agent::task_engine::TaskRunRequest {
+            channel,
+            sender_key: "gateway-user",
+            reply_target: "gateway-user",
+            original_request: message,
+            provider: provider.as_ref(),
+            history: &mut history,
+            tools_registry: &tools_registry,
+            observer: observer.as_ref(),
+            provider_name,
+            model: &model_name,
+            temperature: config.default_temperature,
+            multimodal: &config.multimodal,
+            max_tool_iterations: config.agent.max_tool_iterations,
+            cancellation_token: None,
+            on_delta: None,
+            hooks: None,
+            excluded_tools,
+            progress_reporter: None,
+        };
+        let outcome = crate::agent::task_engine::TaskEngine::run_task(req, &engine).await?;
+        Ok(outcome.final_response)
+    } else {
+        agent_turn(
+            provider.as_ref(),
+            &mut history,
+            &tools_registry,
+            observer.as_ref(),
+            provider_name,
+            &model_name,
+            config.default_temperature,
+            true,
+            &config.multimodal,
+            config.agent.max_tool_iterations,
+        )
+        .await
+    }
+}
+
+pub async fn process_message(config: Config, message: &str) -> Result<String> {
+    process_message_with_channel(config, message, "cli").await
 }
 
 #[cfg(test)]
