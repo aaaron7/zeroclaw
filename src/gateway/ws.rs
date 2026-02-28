@@ -21,6 +21,7 @@ use axum::{
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use std::sync::Arc;
+use tokio::sync::mpsc;
 
 #[derive(Deserialize)]
 pub struct WsQuery {
@@ -98,31 +99,45 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
         }));
 
         // Use the same autonomous task engine path as iMessage for parity.
+        // Progress frames are sent through a single channel worker so ordering is stable.
+        let (progress_tx, mut progress_rx) = mpsc::unbounded_channel::<String>();
         let ws_sender_for_progress = Arc::clone(&sender);
+        let progress_pump = tokio::spawn(async move {
+            while let Some(progress) = progress_rx.recv().await {
+                let progress_frame = serde_json::json!({
+                    "type": "progress",
+                    "content": progress,
+                });
+                let mut ws_sender = ws_sender_for_progress.lock().await;
+                if ws_sender
+                    .send(Message::Text(progress_frame.to_string().into()))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        let progress_tx_for_reporter = progress_tx.clone();
         let progress_reporter: crate::agent::task_engine::TaskProgressReporter =
             Arc::new(move |progress: String| {
-                let ws_sender_for_progress = Arc::clone(&ws_sender_for_progress);
-                tokio::spawn(async move {
-                    let progress_frame = serde_json::json!({
-                        "type": "progress",
-                        "content": progress,
-                    });
-                    let mut ws_sender = ws_sender_for_progress.lock().await;
-                    let _ = ws_sender
-                        .send(Message::Text(progress_frame.to_string().into()))
-                        .await;
-                });
+                let _ = progress_tx_for_reporter.send(progress);
             });
 
         let config = state.config.lock().clone();
-        match crate::agent::loop_::process_message_with_channel_with_progress(
+        let task_result = crate::agent::loop_::process_message_with_channel_with_progress(
             config,
             &content,
             "web_dashboard",
             Some(progress_reporter),
         )
-        .await
-        {
+        .await;
+
+        // Ensure all queued progress frames are flushed before terminal done/error.
+        drop(progress_tx);
+        let _ = progress_pump.await;
+
+        match task_result {
             Ok(response) => {
                 // Send the full response as a done message
                 let done = serde_json::json!({
