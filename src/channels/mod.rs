@@ -3375,8 +3375,13 @@ pub async fn start_channels(config: Config) -> Result<()> {
         .telegram
         .as_ref()
         .is_some_and(|tg| tg.interrupt_on_new_message);
+    let task_engine_cfg = crate::agent::task_engine::TaskEngineConfig {
+        gray_zone_verifier_enabled: config.autonomy.gray_zone_verifier_enabled,
+        gray_zone_verifier_timeout_ms: config.autonomy.gray_zone_verifier_timeout_ms,
+        ..crate::agent::task_engine::TaskEngineConfig::default()
+    };
     let task_engine =
-        match crate::agent::task_engine::TaskEngine::default_for_workspace(&config.workspace_dir) {
+        match crate::agent::task_engine::TaskEngine::new(&config.workspace_dir, task_engine_cfg) {
             Ok(engine) => Some(Arc::new(engine)),
             Err(err) => {
                 tracing::warn!(
@@ -4612,6 +4617,8 @@ BTC is currently around $65,000 based on latest tool output."#
             crate::agent::task_engine::TaskEngineConfig {
                 max_continuation_rounds: 4,
                 provider_retry_limit: 0,
+                gray_zone_verifier_enabled: false,
+                gray_zone_verifier_timeout_ms: 1500,
             },
         )
         .expect("task engine");

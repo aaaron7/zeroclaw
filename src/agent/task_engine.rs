@@ -1,5 +1,9 @@
+use crate::agent::gray_zone_verifier::{
+    GrayZoneVerdict, GrayZoneVerificationRequest, GrayZoneVerifier, ProviderGrayZoneVerifier,
+};
 use crate::agent::loop_::run_tool_call_loop;
 use crate::agent::task_completion::{evaluate_completion, CompletionDecision};
+use crate::agent::task_contract::TaskType;
 use crate::agent::task_contract_compiler::compile_contract;
 use crate::agent::task_store::TaskStore;
 use crate::agent::task_types::TaskStatus;
@@ -18,6 +22,8 @@ use uuid::Uuid;
 pub struct TaskEngineConfig {
     pub max_continuation_rounds: usize,
     pub provider_retry_limit: usize,
+    pub gray_zone_verifier_enabled: bool,
+    pub gray_zone_verifier_timeout_ms: u64,
 }
 
 impl Default for TaskEngineConfig {
@@ -25,6 +31,8 @@ impl Default for TaskEngineConfig {
         Self {
             max_continuation_rounds: 4,
             provider_retry_limit: 2,
+            gray_zone_verifier_enabled: true,
+            gray_zone_verifier_timeout_ms: 1500,
         }
     }
 }
@@ -39,6 +47,7 @@ pub struct TaskRunOutcome {
 pub struct TaskEngine {
     store: TaskStore,
     cfg: TaskEngineConfig,
+    gray_zone_verifier: Arc<dyn GrayZoneVerifier>,
 }
 
 pub type TaskProgressReporter = Arc<dyn Fn(String) + Send + Sync>;
@@ -66,8 +75,23 @@ pub struct TaskRunRequest<'a> {
 
 impl TaskEngine {
     pub fn new(workspace_dir: &std::path::Path, cfg: TaskEngineConfig) -> Result<Self> {
+        let verifier = Arc::new(ProviderGrayZoneVerifier::new(
+            cfg.gray_zone_verifier_timeout_ms,
+        ));
+        Self::with_verifier(workspace_dir, cfg, verifier)
+    }
+
+    pub fn with_verifier(
+        workspace_dir: &std::path::Path,
+        cfg: TaskEngineConfig,
+        gray_zone_verifier: Arc<dyn GrayZoneVerifier>,
+    ) -> Result<Self> {
         let store = TaskStore::new(workspace_dir)?;
-        Ok(Self { store, cfg })
+        Ok(Self {
+            store,
+            cfg,
+            gray_zone_verifier,
+        })
     }
 
     pub fn store(&self) -> &TaskStore {
@@ -210,6 +234,86 @@ impl TaskEngine {
                     reason,
                     missing_requirements,
                 } => {
+                    if self.cfg.gray_zone_verifier_enabled
+                        && should_invoke_gray_zone_verifier(
+                            &reason,
+                            &missing_requirements,
+                            contract.task_type,
+                        )
+                    {
+                        let verifier_request = GrayZoneVerificationRequest {
+                            provider: req.provider,
+                            model: req.model,
+                            original_request: req.original_request,
+                            model_response: &response,
+                            continue_reason: &reason,
+                            missing_requirements: &missing_requirements,
+                        };
+                        match self.gray_zone_verifier.verify(verifier_request).await {
+                            Ok(GrayZoneVerdict {
+                                done: true,
+                                reason: verifier_reason,
+                            }) if gray_zone_completion_allowed(
+                                contract.task_type,
+                                &missing_requirements,
+                            ) =>
+                            {
+                                let _ = self.store.append_event(
+                                    task_id,
+                                    "gray_zone_verifier",
+                                    Some(&serde_json::json!({
+                                        "result":"done",
+                                        "reason": verifier_reason,
+                                        "round": round + 1
+                                    })),
+                                );
+                                let _ = self.store.update_status(task_id, TaskStatus::Completed);
+                                let _ = self.store.append_event(
+                                    task_id,
+                                    "completed",
+                                    Some(&serde_json::json!({
+                                        "round": round + 1,
+                                        "reason":"gray_zone_verifier_done"
+                                    })),
+                                );
+                                emit_progress(
+                                    req,
+                                    format!(
+                                        "✅ 任务完成（第 {} 轮，gray-zone verifier 确认）。",
+                                        round + 1
+                                    ),
+                                );
+                                return Ok(TaskRunOutcome {
+                                    task_id: task_id.to_string(),
+                                    final_response: response,
+                                    write_verified,
+                                });
+                            }
+                            Ok(verdict) => {
+                                let _ = self.store.append_event(
+                                    task_id,
+                                    "gray_zone_verifier",
+                                    Some(&serde_json::json!({
+                                        "result":"continue",
+                                        "done": verdict.done,
+                                        "reason": verdict.reason,
+                                        "round": round + 1
+                                    })),
+                                );
+                            }
+                            Err(err) => {
+                                let _ = self.store.append_event(
+                                    task_id,
+                                    "gray_zone_verifier_error",
+                                    Some(&serde_json::json!({
+                                        "error": format!("{err:#}"),
+                                        "round": round + 1
+                                    })),
+                                );
+                            }
+                        }
+                    }
+
                     let _ = self.store.append_event(
                         task_id,
                         "continue",
@@ -382,6 +486,20 @@ fn enabled_tools_for_contract(
         .collect()
 }
 
+fn should_invoke_gray_zone_verifier(
+    reason: &str,
+    missing_requirements: &[String],
+    task_type: TaskType,
+) -> bool {
+    task_type == TaskType::Unknown
+        && missing_requirements.is_empty()
+        && reason == "unknown_contract_non_terminal_update"
+}
+
+fn gray_zone_completion_allowed(task_type: TaskType, missing_requirements: &[String]) -> bool {
+    task_type == TaskType::Unknown && missing_requirements.is_empty()
+}
+
 fn emit_progress(req: &TaskRunRequest<'_>, message: impl Into<String>) {
     if let Some(reporter) = req.progress_reporter.as_ref() {
         reporter(message.into());
@@ -391,6 +509,7 @@ fn emit_progress(req: &TaskRunRequest<'_>, message: impl Into<String>) {
 fn explain_continue_reason(reason: &str) -> &str {
     match reason {
         "missing_required_evidence" => "缺少合同要求的工具执行证据",
+        "unknown_contract_non_terminal_update" => "未知任务类型且回复仍处于进行中",
         "guardrail_notice" => "触发 guardrail 继续执行",
         _ => reason,
     }
@@ -401,11 +520,15 @@ mod tests {
     use super::{
         is_retryable_provider_transport_error, TaskEngine, TaskEngineConfig, TaskRunRequest,
     };
+    use crate::agent::gray_zone_verifier::{
+        GrayZoneVerdict, GrayZoneVerificationRequest, GrayZoneVerifier,
+    };
     use crate::observability::NoopObserver;
     use crate::providers::{ChatMessage, Provider};
     use crate::tools::Tool;
     use async_trait::async_trait;
-    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
     use tempfile::TempDir;
 
     struct ScriptedProvider {
@@ -437,6 +560,42 @@ mod tests {
         }
     }
 
+    struct ScriptedGrayZoneVerifier {
+        results: Mutex<Vec<anyhow::Result<GrayZoneVerdict>>>,
+        call_count: AtomicUsize,
+    }
+
+    impl ScriptedGrayZoneVerifier {
+        fn new(results: Vec<anyhow::Result<GrayZoneVerdict>>) -> Self {
+            Self {
+                results: Mutex::new(results),
+                call_count: AtomicUsize::new(0),
+            }
+        }
+
+        fn calls(&self) -> usize {
+            self.call_count.load(Ordering::Relaxed)
+        }
+    }
+
+    #[async_trait]
+    impl GrayZoneVerifier for ScriptedGrayZoneVerifier {
+        async fn verify(
+            &self,
+            _request: GrayZoneVerificationRequest<'_>,
+        ) -> anyhow::Result<GrayZoneVerdict> {
+            self.call_count.fetch_add(1, Ordering::Relaxed);
+            let mut guard = self.results.lock().unwrap_or_else(|e| e.into_inner());
+            if guard.is_empty() {
+                return Ok(GrayZoneVerdict {
+                    done: false,
+                    reason: "no_scripted_result".to_string(),
+                });
+            }
+            guard.remove(0)
+        }
+    }
+
     #[test]
     fn provider_transport_error_is_classified_retryable() {
         let err = anyhow::anyhow!(
@@ -453,6 +612,8 @@ mod tests {
             TaskEngineConfig {
                 max_continuation_rounds: 4,
                 provider_retry_limit: 0,
+                gray_zone_verifier_enabled: false,
+                gray_zone_verifier_timeout_ms: 1500,
             },
         )
         .expect("task engine");
@@ -509,6 +670,8 @@ mod tests {
             TaskEngineConfig {
                 max_continuation_rounds: 2,
                 provider_retry_limit: 1,
+                gray_zone_verifier_enabled: false,
+                gray_zone_verifier_timeout_ms: 1500,
             },
         )
         .expect("task engine");
@@ -553,6 +716,184 @@ mod tests {
             .expect("get task")
             .expect("task exists");
         assert!(row.provider_retry_count >= 1);
+        assert_eq!(row.status.as_str(), "completed");
+    }
+
+    #[tokio::test]
+    async fn run_task_invokes_gray_zone_verifier_once_for_unknown_progress_update() {
+        let tmp = TempDir::new().expect("tempdir");
+        let verifier = Arc::new(ScriptedGrayZoneVerifier::new(vec![Ok(GrayZoneVerdict {
+            done: false,
+            reason: "need_more_work".to_string(),
+        })]));
+        let engine = TaskEngine::with_verifier(
+            tmp.path(),
+            TaskEngineConfig {
+                max_continuation_rounds: 4,
+                provider_retry_limit: 0,
+                gray_zone_verifier_enabled: true,
+                gray_zone_verifier_timeout_ms: 1500,
+            },
+            verifier.clone(),
+        )
+        .expect("task engine");
+        let provider = ScriptedProvider::new(vec![
+            Ok("我正在检查当前文件状态。".to_string()),
+            Ok("任务已完成。".to_string()),
+        ]);
+        let observer = NoopObserver;
+        let mut history = vec![
+            ChatMessage::system("system"),
+            ChatMessage::user("请继续处理这个任务"),
+        ];
+        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let req = TaskRunRequest {
+            channel: "imessage",
+            sender_key: "sender-a",
+            reply_target: "sender-a",
+            original_request: "请继续处理这个任务",
+            provider: &provider,
+            history: &mut history,
+            tools_registry: &tools_registry,
+            observer: &observer,
+            provider_name: "test-provider",
+            model: "test-model",
+            temperature: 0.0,
+            multimodal: &crate::config::MultimodalConfig::default(),
+            max_tool_iterations: 5,
+            cancellation_token: None,
+            on_delta: None,
+            hooks: None,
+            excluded_tools: &[],
+            progress_reporter: None,
+        };
+
+        let outcome = TaskEngine::run_task(req, &engine)
+            .await
+            .expect("task should complete");
+        assert_eq!(outcome.final_response, "任务已完成。");
+        assert_eq!(verifier.calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn run_task_gray_zone_verifier_done_true_completes_in_same_round() {
+        let tmp = TempDir::new().expect("tempdir");
+        let verifier = Arc::new(ScriptedGrayZoneVerifier::new(vec![Ok(GrayZoneVerdict {
+            done: true,
+            reason: "verified_done".to_string(),
+        })]));
+        let engine = TaskEngine::with_verifier(
+            tmp.path(),
+            TaskEngineConfig {
+                max_continuation_rounds: 4,
+                provider_retry_limit: 0,
+                gray_zone_verifier_enabled: true,
+                gray_zone_verifier_timeout_ms: 1500,
+            },
+            verifier.clone(),
+        )
+        .expect("task engine");
+        let provider = ScriptedProvider::new(vec![Ok("我正在检查当前文件状态。".to_string())]);
+        let observer = NoopObserver;
+        let mut history = vec![
+            ChatMessage::system("system"),
+            ChatMessage::user("请继续处理这个任务"),
+        ];
+        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let req = TaskRunRequest {
+            channel: "imessage",
+            sender_key: "sender-a",
+            reply_target: "sender-a",
+            original_request: "请继续处理这个任务",
+            provider: &provider,
+            history: &mut history,
+            tools_registry: &tools_registry,
+            observer: &observer,
+            provider_name: "test-provider",
+            model: "test-model",
+            temperature: 0.0,
+            multimodal: &crate::config::MultimodalConfig::default(),
+            max_tool_iterations: 5,
+            cancellation_token: None,
+            on_delta: None,
+            hooks: None,
+            excluded_tools: &[],
+            progress_reporter: None,
+        };
+
+        let outcome = TaskEngine::run_task(req, &engine)
+            .await
+            .expect("task should complete");
+        assert_eq!(outcome.final_response, "我正在检查当前文件状态。");
+        assert_eq!(verifier.calls(), 1);
+        let row = engine
+            .store()
+            .get_task_run(&outcome.task_id)
+            .expect("get task")
+            .expect("task exists");
+        assert_eq!(row.status.as_str(), "completed");
+        assert_eq!(row.attempt_count, 1);
+    }
+
+    #[tokio::test]
+    async fn run_task_gray_zone_verifier_error_falls_back_to_conservative_continue() {
+        let tmp = TempDir::new().expect("tempdir");
+        let verifier = Arc::new(ScriptedGrayZoneVerifier::new(vec![Err(anyhow::anyhow!(
+            "gray-zone verifier timed out"
+        ))]));
+        let engine = TaskEngine::with_verifier(
+            tmp.path(),
+            TaskEngineConfig {
+                max_continuation_rounds: 4,
+                provider_retry_limit: 0,
+                gray_zone_verifier_enabled: true,
+                gray_zone_verifier_timeout_ms: 1500,
+            },
+            verifier.clone(),
+        )
+        .expect("task engine");
+        let provider = ScriptedProvider::new(vec![
+            Ok("我正在检查当前文件状态。".to_string()),
+            Ok("任务已完成。".to_string()),
+        ]);
+        let observer = NoopObserver;
+        let mut history = vec![
+            ChatMessage::system("system"),
+            ChatMessage::user("请继续处理这个任务"),
+        ];
+        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let req = TaskRunRequest {
+            channel: "imessage",
+            sender_key: "sender-a",
+            reply_target: "sender-a",
+            original_request: "请继续处理这个任务",
+            provider: &provider,
+            history: &mut history,
+            tools_registry: &tools_registry,
+            observer: &observer,
+            provider_name: "test-provider",
+            model: "test-model",
+            temperature: 0.0,
+            multimodal: &crate::config::MultimodalConfig::default(),
+            max_tool_iterations: 5,
+            cancellation_token: None,
+            on_delta: None,
+            hooks: None,
+            excluded_tools: &[],
+            progress_reporter: None,
+        };
+
+        let outcome = TaskEngine::run_task(req, &engine)
+            .await
+            .expect("task should complete");
+        assert_eq!(outcome.final_response, "任务已完成。");
+        assert_eq!(verifier.calls(), 1);
+        let row = engine
+            .store()
+            .get_task_run(&outcome.task_id)
+            .expect("get task")
+            .expect("task exists");
+        assert!(row.attempt_count >= 2);
         assert_eq!(row.status.as_str(), "completed");
     }
 }

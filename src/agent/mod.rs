@@ -4,6 +4,7 @@ pub mod classifier;
 pub mod contract_gate;
 pub mod dispatcher;
 pub mod evidence_ledger;
+pub mod gray_zone_verifier;
 pub mod loop_;
 pub mod memory_loader;
 pub mod prompt;
