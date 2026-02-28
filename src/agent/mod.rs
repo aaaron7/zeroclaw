@@ -1,6 +1,7 @@
 #[allow(clippy::module_inception)]
 pub mod agent;
 pub mod classifier;
+pub mod contract_gate;
 pub mod dispatcher;
 pub mod evidence_ledger;
 pub mod loop_;

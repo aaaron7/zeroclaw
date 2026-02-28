@@ -1,10 +1,22 @@
+use crate::agent::contract_gate::ContractGate;
 use crate::agent::evidence_ledger::collect_evidence_from_history;
+use crate::agent::task_contract::{GateDecision, TaskContract, TaskType};
 use crate::providers::ChatMessage;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CompletionDecision {
     Complete,
-    Continue { reason: String },
+    Continue {
+        reason: String,
+        missing_requirements: Vec<String>,
+    },
+    Blocked {
+        reason: String,
+        remediation: String,
+    },
+    Failed {
+        reason: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -14,109 +26,89 @@ pub struct CompletionEvaluation {
     pub saw_post_write_read_after_success: bool,
 }
 
-pub fn evaluate_completion(response_text: &str, history: &[ChatMessage]) -> CompletionEvaluation {
+pub fn evaluate_completion(
+    contract: &TaskContract,
+    response_text: &str,
+    history: &[ChatMessage],
+    original_request: &str,
+) -> CompletionEvaluation {
     let evidence = collect_evidence_from_history(history);
 
-    if response_text.contains("[Guardrail Notice]") {
-        return CompletionEvaluation {
-            decision: CompletionDecision::Continue {
-                reason: "guardrail_notice".to_string(),
-            },
-            saw_successful_write: evidence.has_successful_write(),
-            saw_post_write_read_after_success: evidence.has_post_write_read_verification(),
-        };
-    }
-
-    if looks_like_filesystem_write_claim(response_text)
-        && !evidence.has_post_write_read_verification()
-    {
-        return CompletionEvaluation {
-            decision: CompletionDecision::Continue {
-                reason: "write_claim_without_post_write_verification".to_string(),
-            },
-            saw_successful_write: evidence.has_successful_write(),
-            saw_post_write_read_after_success: evidence.has_post_write_read_verification(),
-        };
-    }
-
-    if looks_like_in_progress_update(response_text) {
-        return CompletionEvaluation {
-            decision: CompletionDecision::Continue {
-                reason: "in_progress_update".to_string(),
-            },
-            saw_successful_write: evidence.has_successful_write(),
-            saw_post_write_read_after_success: evidence.has_post_write_read_verification(),
-        };
-    }
+    let decision = if response_text.contains("[Guardrail Notice]") {
+        CompletionDecision::Continue {
+            reason: "guardrail_notice".to_string(),
+            missing_requirements: Vec::new(),
+        }
+    } else {
+        let gate_decision =
+            ContractGate::evaluate(contract, &evidence, response_text, original_request);
+        if matches!(gate_decision, GateDecision::Complete { .. })
+            && contract.task_type == TaskType::Unknown
+            && !has_any_tool_evidence(&evidence)
+            && looks_like_non_terminal_update(response_text)
+        {
+            CompletionDecision::Continue {
+                reason: "unknown_contract_non_terminal_update".to_string(),
+                missing_requirements: Vec::new(),
+            }
+        } else {
+            match gate_decision {
+                GateDecision::Complete { .. } => CompletionDecision::Complete,
+                GateDecision::Continue {
+                    reason,
+                    missing_requirements,
+                } => CompletionDecision::Continue {
+                    reason,
+                    missing_requirements,
+                },
+                GateDecision::Blocked {
+                    reason,
+                    remediation,
+                } => CompletionDecision::Blocked {
+                    reason,
+                    remediation,
+                },
+                GateDecision::Failed { reason } => CompletionDecision::Failed { reason },
+            }
+        }
+    };
 
     CompletionEvaluation {
-        decision: CompletionDecision::Complete,
+        decision,
         saw_successful_write: evidence.has_successful_write(),
         saw_post_write_read_after_success: evidence.has_post_write_read_verification(),
     }
 }
 
-fn looks_like_filesystem_write_claim(text: &str) -> bool {
-    let lower = text.to_ascii_lowercase();
-    let chinese_claim_hints = [
-        "已写入",
-        "已经写入",
-        "写到了",
-        "已保存",
-        "已经保存",
-        "保存到",
-        "保存在",
-        "保存于",
-        "已存储",
-        "已经存储",
-        "存储到",
-        "已创建",
-        "已经创建",
-        "成功创建",
-        "已成功创建",
-        "文件已成功创建",
-        "已生成",
-        "已经生成",
-        "已更新",
-        "已经更新",
-    ];
-    if chinese_claim_hints.iter().any(|hint| text.contains(hint)) {
-        return true;
-    }
-
-    let completion_verbs = [
-        "i wrote",
-        "written to",
-        "saved to",
-        "saved as",
-        "has been saved",
-        "has been written",
-        "created at",
-        "created the file",
-        "updated the file",
-        "generated the report",
-        "i updated",
-        "i created",
-        "i saved",
-    ];
-
-    let file_indicators = [
-        "/", "\\", ".md", ".txt", ".rs", ".json", ".yaml", ".yml", ".toml", " file ", " path ",
-        "docs/", "src/",
-    ];
-
-    completion_verbs.iter().any(|hint| lower.contains(hint))
-        && file_indicators.iter().any(|hint| lower.contains(hint))
+fn has_any_tool_evidence(evidence: &crate::agent::evidence_ledger::EvidenceLedger) -> bool {
+    evidence.has_successful_write()
+        || evidence.has_successful_read()
+        || evidence.has_successful_search()
 }
 
-fn looks_like_in_progress_update(text: &str) -> bool {
+fn looks_like_non_terminal_update(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
-
+    let progress_hints = [
+        "i'm checking",
+        "i am checking",
+        "let me check",
+        "let me search",
+        "i will search",
+        "i'll search",
+        "working on",
+        "我正在",
+        "我先",
+        "让我先",
+        "我会",
+        "我这就",
+        "马上给你",
+        "继续处理中",
+    ];
     let completion_hints = [
         "done",
         "completed",
         "finished",
-        "successfully",
+        "任务完成",
         "已完成",
         "已经完成",
         "完成了",
@@ -127,98 +119,111 @@ fn looks_like_in_progress_update(text: &str) -> bool {
         "成功创建",
         "已生成",
         "已经生成",
-        "已更新",
-        "已经更新",
-    ];
-    if completion_hints
-        .iter()
-        .any(|hint| lower.contains(hint) || text.contains(hint))
-    {
-        return false;
-    }
-
-    let progress_hints = [
-        "i'm checking",
-        "let me check",
-        "i am checking",
-        "i'm reviewing",
-        "let me review",
-        "i need to inspect",
-        "working on",
-        "currently implementing",
-        "我正在",
-        "让我检查",
-        "我先检查",
-        "让我先查看",
-        "我需要先查看",
-        "正在实施",
     ];
 
     progress_hints
         .iter()
         .any(|hint| lower.contains(hint) || text.contains(hint))
+        && !completion_hints
+            .iter()
+            .any(|hint| lower.contains(hint) || text.contains(hint))
 }
 
 #[cfg(test)]
 mod tests {
     use super::{evaluate_completion, CompletionDecision};
+    use crate::agent::task_contract::{EvidenceRequirement, TaskContract, TaskType};
     use crate::providers::ChatMessage;
 
     #[test]
-    fn completion_evaluator_blocks_write_claim_without_evidence() {
-        let history = vec![
-            ChatMessage::assistant(
-                r#"<tool_call>
-{"name":"file_write","arguments":{"path":"a.md","content":"x"}}
-</tool_call>"#,
-            ),
-            ChatMessage::user("[Tool results]\n<tool_result name=\"file_write\">\nAction blocked: denied\n</tool_result>"),
-        ];
+    fn completion_evaluator_requires_write_evidence_even_when_model_claims_saved() {
+        let contract = TaskContract::new(TaskType::WriteArtifact)
+            .with_requirement(EvidenceRequirement::tool_success("file_write"))
+            .with_requirement(EvidenceRequirement::tool_success("file_read"));
+        let history = vec![ChatMessage::user("帮我保存报告到工作空间")];
 
-        let eval = evaluate_completion("好的，我已经保存到 a.md。", &history);
+        let eval = evaluate_completion(
+            &contract,
+            "好的，我已经保存到 report.md。",
+            &history,
+            "保存报告",
+        );
         assert_eq!(
             eval.decision,
             CompletionDecision::Continue {
-                reason: "write_claim_without_post_write_verification".to_string()
+                reason: "missing_required_evidence".to_string(),
+                missing_requirements: vec![
+                    "tool_success:file_write".to_string(),
+                    "tool_success:file_read".to_string(),
+                ],
             }
         );
-        assert!(!eval.saw_successful_write);
-        assert!(!eval.saw_post_write_read_after_success);
     }
 
     #[test]
-    fn completion_evaluator_accepts_write_claim_after_post_write_read_verification() {
+    fn completion_evaluator_accepts_write_after_post_write_verification() {
+        let contract = TaskContract::new(TaskType::WriteArtifact)
+            .with_requirement(EvidenceRequirement::tool_success("file_write"))
+            .with_requirement(EvidenceRequirement::tool_success("file_read"));
         let history = vec![
             ChatMessage::assistant(
                 r#"<tool_call>
 {"name":"file_write","arguments":{"path":"report.md","content":"abc"}}
 </tool_call>"#,
             ),
-            ChatMessage::user("[Tool results]\n<tool_result name=\"file_write\">\nWritten 3 bytes to report.md\n</tool_result>"),
+            ChatMessage::user(
+                "[Tool results]\n<tool_result name=\"file_write\">\nWritten 3 bytes to report.md\n</tool_result>",
+            ),
             ChatMessage::assistant(
                 r#"<tool_call>
 {"name":"file_read","arguments":{"path":"report.md"}}
 </tool_call>"#,
             ),
-            ChatMessage::user(
-                "[Tool results]\n<tool_result name=\"file_read\">\nabc\n</tool_result>",
-            ),
+            ChatMessage::user("[Tool results]\n<tool_result name=\"file_read\">\nabc\n</tool_result>"),
         ];
 
-        let eval = evaluate_completion("报告已保存到 report.md。", &history);
+        let eval = evaluate_completion(&contract, "报告已保存到 report.md。", &history, "保存报告");
         assert_eq!(eval.decision, CompletionDecision::Complete);
         assert!(eval.saw_successful_write);
         assert!(eval.saw_post_write_read_after_success);
     }
 
     #[test]
-    fn completion_evaluator_detects_in_progress_update() {
-        let history = vec![ChatMessage::user("帮我继续实现")];
-        let eval = evaluate_completion("我正在检查当前文件状态。", &history);
+    fn completion_evaluator_marks_workspace_denied_as_blocked() {
+        let contract = TaskContract::new(TaskType::WorkspaceAnalysis)
+            .with_requirement(EvidenceRequirement::tool_success("file_read"));
+        let history = vec![
+            ChatMessage::assistant(
+                r#"<tool_call>
+{"name":"file_read","arguments":{"path":"studio"}}
+</tool_call>"#,
+            ),
+            ChatMessage::user(
+                "[Tool results]\n<tool_result name=\"file_read\">\nERROR: path not allowed outside workspace\n</tool_result>",
+            ),
+        ];
+
+        let eval = evaluate_completion(&contract, "我继续分析", &history, "分析 studio");
+        assert_eq!(
+            eval.decision,
+            CompletionDecision::Blocked {
+                reason: "workspace_access_denied".to_string(),
+                remediation: "Add the target path to `autonomy.allowed_roots` or move the project inside workspace before retrying.".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn completion_evaluator_keeps_unknown_contract_running_for_progress_only_update() {
+        let contract = TaskContract::new(TaskType::Unknown);
+        let history = vec![ChatMessage::user("继续处理")];
+
+        let eval = evaluate_completion(&contract, "我正在检查当前文件状态。", &history, "继续处理");
         assert_eq!(
             eval.decision,
             CompletionDecision::Continue {
-                reason: "in_progress_update".to_string()
+                reason: "unknown_contract_non_terminal_update".to_string(),
+                missing_requirements: Vec::new(),
             }
         );
     }

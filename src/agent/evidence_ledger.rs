@@ -1,5 +1,5 @@
 use crate::providers::ChatMessage;
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 
 #[derive(Debug, Clone, Default)]
 pub struct EvidenceLedger {
@@ -7,6 +7,9 @@ pub struct EvidenceLedger {
     saw_successful_read: bool,
     saw_successful_search: bool,
     saw_post_write_read_verification: bool,
+    successful_tools: HashSet<String>,
+    failed_tools: HashSet<String>,
+    saw_access_denied_failure: bool,
 }
 
 impl EvidenceLedger {
@@ -24,6 +27,20 @@ impl EvidenceLedger {
 
     pub fn has_post_write_read_verification(&self) -> bool {
         self.saw_post_write_read_verification
+    }
+
+    pub fn has_successful_tool(&self, tool_name: &str) -> bool {
+        self.successful_tools
+            .contains(&tool_name.trim().to_ascii_lowercase())
+    }
+
+    pub fn has_failed_tool(&self, tool_name: &str) -> bool {
+        self.failed_tools
+            .contains(&tool_name.trim().to_ascii_lowercase())
+    }
+
+    pub fn has_access_denied_failure(&self) -> bool {
+        self.saw_access_denied_failure
     }
 }
 
@@ -113,6 +130,7 @@ fn collect_tool_result_evidence(
         };
         let output = after_body_start[..close_idx].trim();
         let is_success = !tool_result_output_likely_failure(output);
+        let normalized_name = tool_name.trim().to_ascii_lowercase();
 
         let kind = match tool_name {
             "file_write" => ToolKind::WriteLike,
@@ -121,6 +139,15 @@ fn collect_tool_result_evidence(
             "shell" => shell_kinds.pop_front().unwrap_or(ToolKind::Other),
             _ => ToolKind::Other,
         };
+
+        if is_success {
+            ledger.successful_tools.insert(normalized_name);
+        } else {
+            ledger.failed_tools.insert(normalized_name);
+            if tool_result_output_likely_access_denied(output) {
+                ledger.saw_access_denied_failure = true;
+            }
+        }
 
         if kind == ToolKind::WriteLike && is_success {
             ledger.saw_successful_write = true;
@@ -147,6 +174,21 @@ fn tool_result_output_likely_failure(output: &str) -> bool {
         || lower.contains("denied")
         || lower.contains("missing")
         || lower.contains("refusing")
+}
+
+fn tool_result_output_likely_access_denied(output: &str) -> bool {
+    let lower = output.to_ascii_lowercase();
+    lower.contains("permission denied")
+        || lower.contains("path not allowed")
+        || lower.contains("not allowed")
+        || lower.contains("access denied")
+        || lower.contains("outside workspace")
+        || lower.contains("forbidden")
+        || output.contains("没有权限")
+        || output.contains("权限不足")
+        || output.contains("路径不允许")
+        || output.contains("无法访问")
+        || output.contains("拒绝访问")
 }
 
 fn classify_shell_command(command: &str) -> ToolKind {
@@ -276,5 +318,23 @@ mod tests {
 
         let ledger = collect_evidence_from_history(&history);
         assert!(!ledger.has_successful_search());
+    }
+
+    #[test]
+    fn evidence_ledger_marks_workspace_access_denied_failures() {
+        let history = vec![
+            ChatMessage::assistant(
+                r#"<tool_call>
+{"name":"file_read","arguments":{"path":"/private/repo"}}
+</tool_call>"#,
+            ),
+            ChatMessage::user(
+                "[Tool results]\n<tool_result name=\"file_read\">\nERROR: path not allowed outside workspace\n</tool_result>",
+            ),
+        ];
+
+        let ledger = collect_evidence_from_history(&history);
+        assert!(ledger.has_failed_tool("file_read"));
+        assert!(ledger.has_access_denied_failure());
     }
 }

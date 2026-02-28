@@ -1,5 +1,6 @@
 use crate::agent::loop_::run_tool_call_loop;
 use crate::agent::task_completion::{evaluate_completion, CompletionDecision};
+use crate::agent::task_contract_compiler::compile_contract;
 use crate::agent::task_store::TaskStore;
 use crate::agent::task_types::TaskStatus;
 use crate::config::MultimodalConfig;
@@ -124,6 +125,26 @@ impl TaskEngine {
         task_id: &str,
         req: &mut TaskRunRequest<'_>,
     ) -> Result<TaskRunOutcome> {
+        let enabled_tools = enabled_tools_for_contract(req.tools_registry, req.excluded_tools);
+        let contract = compile_contract(
+            req.original_request,
+            req.channel,
+            &enabled_tools,
+            &crate::config::AutonomyConfig::default(),
+        );
+        let _ = self.store.append_event(
+            task_id,
+            "contract_compiled",
+            Some(&serde_json::json!({
+                "task_type": format!("{:?}", contract.task_type),
+                "required_evidence": contract
+                    .required_evidence
+                    .iter()
+                    .map(|r| r.id.clone())
+                    .collect::<Vec<String>>()
+            })),
+        );
+
         let mut write_verified = false;
         let mut consecutive_progress_only = 0usize;
 
@@ -154,7 +175,7 @@ impl TaskEngine {
 
             let _ = self.store.increment_attempt_count(task_id);
             let _ = self.store.set_last_response(task_id, &response);
-            let eval = evaluate_completion(&response, req.history);
+            let eval = evaluate_completion(&contract, &response, req.history, req.original_request);
 
             if eval.saw_post_write_read_after_success && !write_verified {
                 write_verified = true;
@@ -185,11 +206,18 @@ impl TaskEngine {
                         write_verified,
                     });
                 }
-                CompletionDecision::Continue { reason } => {
+                CompletionDecision::Continue {
+                    reason,
+                    missing_requirements,
+                } => {
                     let _ = self.store.append_event(
                         task_id,
                         "continue",
-                        Some(&serde_json::json!({"reason": reason, "round": round + 1})),
+                        Some(&serde_json::json!({
+                            "reason": reason,
+                            "round": round + 1,
+                            "missing_requirements": missing_requirements
+                        })),
                     );
                     emit_progress(
                         req,
@@ -214,6 +242,42 @@ impl TaskEngine {
                     req.history.push(ChatMessage::user(
                         "[Task Engine]\n任务尚未完成。请继续执行必要的工具操作并在有可验证结果后再给最终答复。不要仅汇报进行中状态。",
                     ));
+                }
+                CompletionDecision::Blocked {
+                    reason,
+                    remediation,
+                } => {
+                    let _ = self.store.update_status(task_id, TaskStatus::Blocked);
+                    let _ = self.store.append_event(
+                        task_id,
+                        "blocked",
+                        Some(&serde_json::json!({
+                            "reason": reason,
+                            "remediation": remediation,
+                            "round": round + 1
+                        })),
+                    );
+                    emit_progress(req, "⛔ 任务被阻塞（缺少必要权限或访问边界不满足）。");
+                    let blocked_summary =
+                        format!("任务已阻塞：{}\n建议处理：{}", reason, remediation);
+                    return Ok(TaskRunOutcome {
+                        task_id: task_id.to_string(),
+                        final_response: blocked_summary,
+                        write_verified,
+                    });
+                }
+                CompletionDecision::Failed { reason } => {
+                    let _ = self.store.update_status(task_id, TaskStatus::Failed);
+                    let _ = self.store.append_event(
+                        task_id,
+                        "failed",
+                        Some(&serde_json::json!({
+                            "reason": reason,
+                            "round": round + 1
+                        })),
+                    );
+                    emit_progress(req, "❌ 任务验证失败。");
+                    anyhow::bail!("Task failed verification: {reason}");
                 }
             }
         }
@@ -307,6 +371,17 @@ fn is_retryable_provider_transport_error(err: &anyhow::Error) -> bool {
         || lower.contains("timed out")
 }
 
+fn enabled_tools_for_contract(
+    tools_registry: &[Box<dyn Tool>],
+    excluded_tools: &[String],
+) -> Vec<String> {
+    tools_registry
+        .iter()
+        .map(|tool| tool.name().to_string())
+        .filter(|name| !excluded_tools.iter().any(|excluded| excluded == name))
+        .collect()
+}
+
 fn emit_progress(req: &TaskRunRequest<'_>, message: impl Into<String>) {
     if let Some(reporter) = req.progress_reporter.as_ref() {
         reporter(message.into());
@@ -315,8 +390,7 @@ fn emit_progress(req: &TaskRunRequest<'_>, message: impl Into<String>) {
 
 fn explain_continue_reason(reason: &str) -> &str {
     match reason {
-        "write_claim_without_post_write_verification" => "检测到写入声明但缺少写后校验",
-        "in_progress_update" => "仅汇报进行中状态",
+        "missing_required_evidence" => "缺少合同要求的工具执行证据",
         "guardrail_notice" => "触发 guardrail 继续执行",
         _ => reason,
     }
