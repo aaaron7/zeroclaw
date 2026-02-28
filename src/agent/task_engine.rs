@@ -73,6 +73,8 @@ pub struct TaskRunRequest<'a> {
     pub progress_reporter: Option<TaskProgressReporter>,
 }
 
+const STALLED_PROGRESS_ONLY_LIMIT: usize = 6;
+
 #[derive(Debug)]
 enum TaskEngineState {
     Running {
@@ -346,7 +348,7 @@ impl TaskEngine {
                                 );
 
                                 consecutive_progress_only += 1;
-                                if consecutive_progress_only >= 3 {
+                                if consecutive_progress_only >= STALLED_PROGRESS_ONLY_LIMIT {
                                     TaskEngineState::Failed {
                                         round,
                                         reason: "stalled_loop".to_string(),
@@ -1155,12 +1157,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn task_engine_state_machine_detects_stalled_loop_after_three_progress_only_rounds() {
+    async fn task_engine_state_machine_detects_stalled_loop_after_six_progress_only_rounds() {
         let tmp = TempDir::new().expect("tempdir");
         let engine = TaskEngine::new(
             tmp.path(),
             TaskEngineConfig {
-                max_continuation_rounds: 4,
+                max_continuation_rounds: 8,
                 provider_retry_limit: 0,
                 gray_zone_verifier_enabled: false,
                 gray_zone_verifier_timeout_ms: 1500,
@@ -1171,7 +1173,10 @@ mod tests {
             Ok("我正在检查当前文件状态。".to_string()),
             Ok("我正在继续处理，请稍等。".to_string()),
             Ok("我会继续处理，请稍等。".to_string()),
-            Ok("还在处理。".to_string()),
+            Ok("我正在处理更多细节，请稍等。".to_string()),
+            Ok("我正在继续推进，请稍等。".to_string()),
+            Ok("我会继续处理，很快给你结果。".to_string()),
+            Ok("我正在收敛结果，请稍后。".to_string()),
         ]);
         let observer = NoopObserver;
         let mut history = vec![
