@@ -1,5 +1,5 @@
+use crate::agent::evidence_ledger::collect_evidence_from_history;
 use crate::providers::ChatMessage;
-use std::collections::VecDeque;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CompletionDecision {
@@ -14,35 +14,28 @@ pub struct CompletionEvaluation {
     pub saw_post_write_read_after_success: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ShellToolKind {
-    WriteLike,
-    ReadLike,
-    Other,
-}
-
 pub fn evaluate_completion(response_text: &str, history: &[ChatMessage]) -> CompletionEvaluation {
-    let evidence = collect_tool_evidence(history);
+    let evidence = collect_evidence_from_history(history);
 
     if response_text.contains("[Guardrail Notice]") {
         return CompletionEvaluation {
             decision: CompletionDecision::Continue {
                 reason: "guardrail_notice".to_string(),
             },
-            saw_successful_write: evidence.saw_successful_write,
-            saw_post_write_read_after_success: evidence.saw_post_write_read_after_success,
+            saw_successful_write: evidence.has_successful_write(),
+            saw_post_write_read_after_success: evidence.has_post_write_read_verification(),
         };
     }
 
     if looks_like_filesystem_write_claim(response_text)
-        && !evidence.saw_post_write_read_after_success
+        && !evidence.has_post_write_read_verification()
     {
         return CompletionEvaluation {
             decision: CompletionDecision::Continue {
                 reason: "write_claim_without_post_write_verification".to_string(),
             },
-            saw_successful_write: evidence.saw_successful_write,
-            saw_post_write_read_after_success: evidence.saw_post_write_read_after_success,
+            saw_successful_write: evidence.has_successful_write(),
+            saw_post_write_read_after_success: evidence.has_post_write_read_verification(),
         };
     }
 
@@ -51,173 +44,16 @@ pub fn evaluate_completion(response_text: &str, history: &[ChatMessage]) -> Comp
             decision: CompletionDecision::Continue {
                 reason: "in_progress_update".to_string(),
             },
-            saw_successful_write: evidence.saw_successful_write,
-            saw_post_write_read_after_success: evidence.saw_post_write_read_after_success,
+            saw_successful_write: evidence.has_successful_write(),
+            saw_post_write_read_after_success: evidence.has_post_write_read_verification(),
         };
     }
 
     CompletionEvaluation {
         decision: CompletionDecision::Complete,
-        saw_successful_write: evidence.saw_successful_write,
-        saw_post_write_read_after_success: evidence.saw_post_write_read_after_success,
+        saw_successful_write: evidence.has_successful_write(),
+        saw_post_write_read_after_success: evidence.has_post_write_read_verification(),
     }
-}
-
-#[derive(Default)]
-struct ToolEvidence {
-    saw_successful_write: bool,
-    saw_post_write_read_after_success: bool,
-}
-
-fn collect_tool_evidence(history: &[ChatMessage]) -> ToolEvidence {
-    let mut evidence = ToolEvidence::default();
-    let mut shell_kinds = VecDeque::new();
-
-    for msg in history {
-        match msg.role.as_str() {
-            "assistant" => {
-                collect_shell_tool_kinds_from_assistant_calls(&msg.content, &mut shell_kinds);
-            }
-            "user" => {
-                collect_tool_result_evidence(
-                    &msg.content,
-                    &mut shell_kinds,
-                    &mut evidence.saw_successful_write,
-                    &mut evidence.saw_post_write_read_after_success,
-                );
-            }
-            _ => {}
-        }
-    }
-
-    evidence
-}
-
-fn collect_shell_tool_kinds_from_assistant_calls(content: &str, out: &mut VecDeque<ShellToolKind>) {
-    const TAG_PAIRS: [(&str, &str); 4] = [
-        ("<tool_call>", "</tool_call>"),
-        ("<toolcall>", "</toolcall>"),
-        ("<tool-call>", "</tool-call>"),
-        ("<invoke>", "</invoke>"),
-    ];
-
-    for (open_tag, close_tag) in TAG_PAIRS {
-        for segment in content.split(open_tag) {
-            let Some(json_end) = segment.find(close_tag) else {
-                continue;
-            };
-            let json_str = segment[..json_end].trim();
-            let Ok(val) = serde_json::from_str::<serde_json::Value>(json_str) else {
-                continue;
-            };
-            let Some(name) = val.get("name").and_then(|n| n.as_str()) else {
-                continue;
-            };
-            if name != "shell" {
-                continue;
-            }
-            let shell_kind = val
-                .get("arguments")
-                .and_then(|args| args.get("command"))
-                .and_then(|cmd| cmd.as_str())
-                .map(classify_shell_command)
-                .unwrap_or(ShellToolKind::Other);
-            out.push_back(shell_kind);
-        }
-    }
-}
-
-fn collect_tool_result_evidence(
-    content: &str,
-    shell_kinds: &mut VecDeque<ShellToolKind>,
-    saw_successful_write: &mut bool,
-    saw_post_write_read_after_success: &mut bool,
-) {
-    let marker = "<tool_result name=\"";
-    let mut remaining = content;
-
-    while let Some(start) = remaining.find(marker) {
-        let name_start = start + marker.len();
-        let after_name_start = &remaining[name_start..];
-        let Some(name_end) = after_name_start.find('"') else {
-            break;
-        };
-        let tool_name = &after_name_start[..name_end];
-        let after_tag_start = &after_name_start[name_end..];
-        let Some(body_start) = after_tag_start.find('>') else {
-            break;
-        };
-        let after_body_start = &after_tag_start[body_start + 1..];
-        let Some(close_idx) = after_body_start.find("</tool_result>") else {
-            break;
-        };
-        let output = after_body_start[..close_idx].trim();
-        let is_success = !tool_result_output_likely_failure(output);
-
-        let kind = match tool_name {
-            "file_write" => ShellToolKind::WriteLike,
-            "file_read" => ShellToolKind::ReadLike,
-            "shell" => shell_kinds.pop_front().unwrap_or(ShellToolKind::Other),
-            _ => ShellToolKind::Other,
-        };
-
-        if kind == ShellToolKind::WriteLike && is_success {
-            *saw_successful_write = true;
-        }
-        if kind == ShellToolKind::ReadLike && is_success && *saw_successful_write {
-            *saw_post_write_read_after_success = true;
-        }
-
-        remaining = &after_body_start[close_idx + "</tool_result>".len()..];
-    }
-}
-
-fn tool_result_output_likely_failure(output: &str) -> bool {
-    let lower = output.to_ascii_lowercase();
-    lower.contains("failed")
-        || lower.contains("error")
-        || lower.contains("not allowed")
-        || lower.contains("denied")
-        || lower.contains("missing")
-        || lower.contains("refusing")
-}
-
-fn classify_shell_command(command: &str) -> ShellToolKind {
-    let lower = command.to_ascii_lowercase();
-
-    if lower.contains(">>")
-        || lower.contains(" > ")
-        || lower.contains("\n>")
-        || lower.contains("tee ")
-        || lower.contains("touch ")
-        || lower.contains("mkdir ")
-        || lower.contains("cp ")
-        || lower.contains("mv ")
-        || lower.contains("truncate ")
-        || lower.contains("sed -i")
-        || lower.contains("perl -i")
-    {
-        return ShellToolKind::WriteLike;
-    }
-
-    if lower.contains("cat ")
-        || lower.contains("less ")
-        || lower.contains("more ")
-        || lower.contains("head ")
-        || lower.contains("tail ")
-        || lower.contains("wc ")
-        || lower.contains("stat ")
-        || lower.contains("ls ")
-        || lower.contains("find ")
-        || lower.contains("rg ")
-        || lower.contains("grep ")
-        || lower.contains("sed -n")
-        || lower.contains("nl ")
-    {
-        return ShellToolKind::ReadLike;
-    }
-
-    ShellToolKind::Other
 }
 
 fn looks_like_filesystem_write_claim(text: &str) -> bool {
