@@ -6,6 +6,7 @@ pub mod loop_;
 pub mod memory_loader;
 pub mod prompt;
 pub mod task_completion;
+pub mod task_contract;
 pub mod task_engine;
 pub mod task_store;
 pub mod task_types;
