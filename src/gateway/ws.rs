@@ -3,6 +3,7 @@
 //! Protocol:
 //! ```text
 //! Client -> Server: {"type":"message","content":"Hello"}
+//! Server -> Client: {"type":"progress","content":"Round 1 running..."}
 //! Server -> Client: {"type":"chunk","content":"Hi! "}
 //! Server -> Client: {"type":"tool_call","name":"shell","args":{...}}
 //! Server -> Client: {"type":"tool_result","name":"shell","output":"..."}
@@ -19,6 +20,7 @@ use axum::{
 };
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
+use std::sync::Arc;
 
 #[derive(Deserialize)]
 pub struct WsQuery {
@@ -48,7 +50,8 @@ pub async fn handle_ws_chat(
 }
 
 async fn handle_socket(socket: WebSocket, state: AppState) {
-    let (mut sender, mut receiver) = socket.split();
+    let (sender, mut receiver) = socket.split();
+    let sender = Arc::new(tokio::sync::Mutex::new(sender));
 
     while let Some(msg) = receiver.next().await {
         let msg = match msg {
@@ -63,7 +66,8 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
             Ok(v) => v,
             Err(_) => {
                 let err = serde_json::json!({"type": "error", "message": "Invalid JSON"});
-                let _ = sender.send(Message::Text(err.to_string().into())).await;
+                let mut ws_sender = sender.lock().await;
+                let _ = ws_sender.send(Message::Text(err.to_string().into())).await;
                 continue;
             }
         };
@@ -94,15 +98,39 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
         }));
 
         // Use the same autonomous task engine path as iMessage for parity.
+        let ws_sender_for_progress = Arc::clone(&sender);
+        let progress_reporter: crate::agent::task_engine::TaskProgressReporter =
+            Arc::new(move |progress: String| {
+                let ws_sender_for_progress = Arc::clone(&ws_sender_for_progress);
+                tokio::spawn(async move {
+                    let progress_frame = serde_json::json!({
+                        "type": "progress",
+                        "content": progress,
+                    });
+                    let mut ws_sender = ws_sender_for_progress.lock().await;
+                    let _ = ws_sender
+                        .send(Message::Text(progress_frame.to_string().into()))
+                        .await;
+                });
+            });
+
         let config = state.config.lock().clone();
-        match crate::agent::process_message_with_channel(config, &content, "web_dashboard").await {
+        match crate::agent::loop_::process_message_with_channel_with_progress(
+            config,
+            &content,
+            "web_dashboard",
+            Some(progress_reporter),
+        )
+        .await
+        {
             Ok(response) => {
                 // Send the full response as a done message
                 let done = serde_json::json!({
                     "type": "done",
                     "full_response": response,
                 });
-                let _ = sender.send(Message::Text(done.to_string().into())).await;
+                let mut ws_sender = sender.lock().await;
+                let _ = ws_sender.send(Message::Text(done.to_string().into())).await;
 
                 // Broadcast agent_end event
                 let _ = state.event_tx.send(serde_json::json!({
@@ -117,7 +145,8 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     "type": "error",
                     "message": sanitized,
                 });
-                let _ = sender.send(Message::Text(err.to_string().into())).await;
+                let mut ws_sender = sender.lock().await;
+                let _ = ws_sender.send(Message::Text(err.to_string().into())).await;
 
                 // Broadcast error event
                 let _ = state.event_tx.send(serde_json::json!({

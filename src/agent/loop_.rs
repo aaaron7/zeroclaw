@@ -3760,6 +3760,15 @@ pub async fn process_message_with_channel(
     message: &str,
     channel: &str,
 ) -> Result<String> {
+    process_message_with_channel_with_progress(config, message, channel, None).await
+}
+
+pub async fn process_message_with_channel_with_progress(
+    config: Config,
+    message: &str,
+    channel: &str,
+    progress_reporter: Option<crate::agent::task_engine::TaskProgressReporter>,
+) -> Result<String> {
     let observer: Arc<dyn Observer> =
         Arc::from(observability::create_observer(&config.observability));
     let runtime: Arc<dyn runtime::RuntimeAdapter> =
@@ -3955,7 +3964,7 @@ pub async fn process_message_with_channel(
             on_delta: None,
             hooks: None,
             excluded_tools,
-            progress_reporter: None,
+            progress_reporter,
         };
         let outcome = crate::agent::task_engine::TaskEngine::run_task(req, &engine).await?;
         Ok(outcome.final_response)

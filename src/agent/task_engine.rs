@@ -74,6 +74,7 @@ pub struct TaskRunRequest<'a> {
 }
 
 const STALLED_PROGRESS_ONLY_LIMIT: usize = 6;
+const ROUND_OUTPUT_PREVIEW_LIMIT: usize = 220;
 
 #[derive(Debug)]
 enum TaskEngineState {
@@ -234,6 +235,14 @@ impl TaskEngine {
                     }
                 }
                 TaskEngineState::Verifying { round, response } => {
+                    emit_progress(
+                        req,
+                        format!(
+                            "🧾 第 {} 轮输出摘要：{}",
+                            round + 1,
+                            summarize_round_output_for_progress(&response)
+                        ),
+                    );
                     let eval = evaluate_completion(
                         &contract,
                         &response,
@@ -585,6 +594,21 @@ fn emit_progress(req: &TaskRunRequest<'_>, message: impl Into<String>) {
     if let Some(reporter) = req.progress_reporter.as_ref() {
         reporter(message.into());
     }
+}
+
+fn summarize_round_output_for_progress(response: &str) -> String {
+    let normalized = response.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.is_empty() {
+        return "（空响应）".to_string();
+    }
+    let mut preview = normalized
+        .chars()
+        .take(ROUND_OUTPUT_PREVIEW_LIMIT)
+        .collect::<String>();
+    if normalized.chars().count() > ROUND_OUTPUT_PREVIEW_LIMIT {
+        preview.push_str("...");
+    }
+    preview
 }
 
 fn explain_continue_reason(reason: &str) -> &str {
@@ -1209,5 +1233,14 @@ mod tests {
             .await
             .expect_err("task should fail due to stalled loop");
         assert!(format!("{err:#}").contains("stalled"));
+    }
+
+    #[test]
+    fn summarize_round_output_for_progress_truncates_and_normalizes_whitespace() {
+        let raw = format!("  第一行  \n 第二行   {}\n\n", "A".repeat(300));
+        let preview = super::summarize_round_output_for_progress(&raw);
+        assert!(preview.contains("第一行 第二行"));
+        assert!(preview.ends_with("..."));
+        assert!(preview.chars().count() <= super::ROUND_OUTPUT_PREVIEW_LIMIT + 3);
     }
 }
