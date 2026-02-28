@@ -1475,6 +1475,18 @@ fn spawn_scoped_typing_task(
     handle
 }
 
+fn should_print_full_terminal_message(channel: &str) -> bool {
+    matches!(channel, "imessage" | "web_dashboard")
+}
+
+fn format_terminal_message(channel: &str, content: &str) -> String {
+    if should_print_full_terminal_message(channel) {
+        content.to_string()
+    } else {
+        truncate_with_ellipsis(content, 80)
+    }
+}
+
 async fn process_channel_message(
     ctx: Arc<ChannelRuntimeContext>,
     msg: traits::ChannelMessage,
@@ -1488,7 +1500,7 @@ async fn process_channel_message(
         "  💬 [{}] from {}: {}",
         msg.channel,
         msg.sender,
-        truncate_with_ellipsis(&msg.content, 80)
+        format_terminal_message(&msg.channel, &msg.content)
     );
     runtime_trace::record_event(
         "channel_message_inbound",
@@ -1938,7 +1950,7 @@ async fn process_channel_message(
             println!(
                 "  🤖 Reply ({}ms): {}",
                 started_at.elapsed().as_millis(),
-                truncate_with_ellipsis(&delivered_response, 80)
+                format_terminal_message(&msg.channel, &delivered_response)
             );
             if let Some(channel) = target_channel.as_ref() {
                 if let Some(ref draft_id) = draft_message_id {

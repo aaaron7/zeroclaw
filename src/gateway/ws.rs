@@ -21,6 +21,7 @@ use axum::{
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::mpsc;
 
 #[derive(Deserialize)]
@@ -82,6 +83,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
         if content.is_empty() {
             continue;
         }
+        println!("  💬 [web_dashboard] from browser: {}", content);
 
         // Process message with the LLM provider
         let provider_label = state
@@ -125,6 +127,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
             });
 
         let config = state.config.lock().clone();
+        let started_at = Instant::now();
         let task_result = crate::agent::loop_::process_message_with_channel_with_progress(
             config,
             &content,
@@ -139,6 +142,11 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
 
         match task_result {
             Ok(response) => {
+                println!(
+                    "  🤖 Reply ({}ms): {}",
+                    started_at.elapsed().as_millis(),
+                    response
+                );
                 // Send the full response as a done message
                 let done = serde_json::json!({
                     "type": "done",
@@ -156,6 +164,11 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
             }
             Err(e) => {
                 let sanitized = crate::providers::sanitize_api_error(&e.to_string());
+                eprintln!(
+                    "  ❌ LLM error after {}ms: {}",
+                    started_at.elapsed().as_millis(),
+                    sanitized
+                );
                 let err = serde_json::json!({
                     "type": "error",
                     "message": sanitized,
