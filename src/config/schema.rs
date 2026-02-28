@@ -1898,6 +1898,18 @@ pub struct AutonomyConfig {
     /// model in tool specs.
     #[serde(default)]
     pub non_cli_excluded_tools: Vec<String>,
+
+    /// Enable contract-based completion verification engine.
+    #[serde(default = "default_true")]
+    pub contract_completion_engine: bool,
+
+    /// Enable gray-zone verifier for near-terminal ambiguous states.
+    #[serde(default = "default_true")]
+    pub gray_zone_verifier_enabled: bool,
+
+    /// Timeout in milliseconds for gray-zone verifier calls.
+    #[serde(default = "default_gray_zone_verifier_timeout_ms")]
+    pub gray_zone_verifier_timeout_ms: u64,
 }
 
 fn default_auto_approve() -> Vec<String> {
@@ -1906,6 +1918,10 @@ fn default_auto_approve() -> Vec<String> {
 
 fn default_always_ask() -> Vec<String> {
     vec![]
+}
+
+fn default_gray_zone_verifier_timeout_ms() -> u64 {
+    1500
 }
 
 fn is_valid_env_var_name(name: &str) -> bool {
@@ -1966,6 +1982,9 @@ impl Default for AutonomyConfig {
             always_ask: default_always_ask(),
             allowed_roots: Vec::new(),
             non_cli_excluded_tools: Vec::new(),
+            contract_completion_engine: true,
+            gray_zone_verifier_enabled: true,
+            gray_zone_verifier_timeout_ms: default_gray_zone_verifier_timeout_ms(),
         }
     }
 }
@@ -3968,6 +3987,9 @@ impl Config {
                 );
             }
         }
+        if self.autonomy.gray_zone_verifier_timeout_ms == 0 {
+            anyhow::bail!("autonomy.gray_zone_verifier_timeout_ms must be greater than 0");
+        }
 
         // Security OTP / estop
         if self.security.otp.token_ttl_secs == 0 {
@@ -4592,6 +4614,21 @@ mod tests {
         assert!(a.require_approval_for_medium_risk);
         assert!(a.block_high_risk_commands);
         assert!(a.shell_env_passthrough.is_empty());
+        assert!(a.contract_completion_engine);
+        assert!(a.gray_zone_verifier_enabled);
+        assert!(a.gray_zone_verifier_timeout_ms > 0);
+    }
+
+    #[test]
+    async fn autonomy_gray_zone_verifier_timeout_must_be_positive() {
+        let mut cfg = Config::default();
+        cfg.autonomy.gray_zone_verifier_timeout_ms = 0;
+        let err = cfg
+            .validate()
+            .expect_err("timeout=0 must be rejected by config validation");
+        assert!(err
+            .to_string()
+            .contains("autonomy.gray_zone_verifier_timeout_ms must be greater than 0"));
     }
 
     #[test]
@@ -4705,6 +4742,9 @@ default_temperature = 0.7
                 always_ask: vec![],
                 allowed_roots: vec![],
                 non_cli_excluded_tools: vec![],
+                contract_completion_engine: true,
+                gray_zone_verifier_enabled: true,
+                gray_zone_verifier_timeout_ms: 1500,
             },
             security: SecurityConfig::default(),
             runtime: RuntimeConfig {
