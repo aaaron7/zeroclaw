@@ -164,8 +164,8 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
             }
             Err(e) => {
                 let sanitized = crate::providers::sanitize_api_error(&e.to_string());
-                eprintln!(
-                    "  ❌ LLM error after {}ms: {}",
+                println!(
+                    "  🤖 Reply ({}ms): [Error] {}",
                     started_at.elapsed().as_millis(),
                     sanitized
                 );

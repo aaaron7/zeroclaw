@@ -2012,6 +2012,11 @@ async fn process_channel_message(
                 } else {
                     "⚠️ Context window exceeded for this conversation. Please resend your last message."
                 };
+                println!(
+                    "  🤖 Reply ({}ms): {}",
+                    started_at.elapsed().as_millis(),
+                    format_terminal_message(&msg.channel, error_text)
+                );
                 eprintln!(
                     "  ⚠️ Context window exceeded after {}ms; sender history compacted={}",
                     started_at.elapsed().as_millis(),
@@ -2050,6 +2055,12 @@ async fn process_channel_message(
                     "  ❌ LLM error after {}ms: {e}",
                     started_at.elapsed().as_millis()
                 );
+                let outbound_error = format!("⚠️ Error: {e}");
+                println!(
+                    "  🤖 Reply ({}ms): {}",
+                    started_at.elapsed().as_millis(),
+                    format_terminal_message(&msg.channel, &outbound_error)
+                );
                 let safe_error = providers::sanitize_api_error(&e.to_string());
                 runtime_trace::record_event(
                     "channel_message_error",
@@ -2082,12 +2093,12 @@ async fn process_channel_message(
                 if let Some(channel) = target_channel.as_ref() {
                     if let Some(ref draft_id) = draft_message_id {
                         let _ = channel
-                            .finalize_draft(&msg.reply_target, draft_id, &format!("⚠️ Error: {e}"))
+                            .finalize_draft(&msg.reply_target, draft_id, &outbound_error)
                             .await;
                     } else {
                         let _ = channel
                             .send(
-                                &SendMessage::new(format!("⚠️ Error: {e}"), &msg.reply_target)
+                                &SendMessage::new(outbound_error, &msg.reply_target)
                                     .in_thread(msg.thread_ts.clone()),
                             )
                             .await;
@@ -2128,6 +2139,11 @@ async fn process_channel_message(
             if let Some(channel) = target_channel.as_ref() {
                 let error_text =
                     "⚠️ Request timed out while waiting for the model. Please try again.";
+                println!(
+                    "  🤖 Reply ({}ms): {}",
+                    started_at.elapsed().as_millis(),
+                    format_terminal_message(&msg.channel, error_text)
+                );
                 if let Some(ref draft_id) = draft_message_id {
                     let _ = channel
                         .finalize_draft(&msg.reply_target, draft_id, error_text)
