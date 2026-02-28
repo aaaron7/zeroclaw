@@ -73,6 +73,31 @@ pub struct TaskRunRequest<'a> {
     pub progress_reporter: Option<TaskProgressReporter>,
 }
 
+#[derive(Debug)]
+enum TaskEngineState {
+    Running {
+        round: usize,
+    },
+    Verifying {
+        round: usize,
+        response: String,
+    },
+    Completed {
+        round: usize,
+        response: String,
+    },
+    Blocked {
+        round: usize,
+        reason: String,
+        remediation: String,
+    },
+    Failed {
+        round: usize,
+        reason: String,
+        error: Option<String>,
+    },
+}
+
 impl TaskEngine {
     pub fn new(workspace_dir: &std::path::Path, cfg: TaskEngineConfig) -> Result<Self> {
         let verifier = Arc::new(ProviderGrayZoneVerifier::new(
@@ -171,52 +196,189 @@ impl TaskEngine {
 
         let mut write_verified = false;
         let mut consecutive_progress_only = 0usize;
+        let mut state = TaskEngineState::Running { round: 0 };
 
-        for round in 0..self.cfg.max_continuation_rounds {
-            emit_progress(
-                req,
-                format!(
-                    "🔄 第 {}/{} 轮执行中…",
-                    round + 1,
-                    self.cfg.max_continuation_rounds
-                ),
-            );
+        loop {
+            state = match state {
+                TaskEngineState::Running { round } => {
+                    if round >= self.cfg.max_continuation_rounds {
+                        TaskEngineState::Failed {
+                            round,
+                            reason: "max_continuation_rounds_exhausted".to_string(),
+                            error: None,
+                        }
+                    } else {
+                        emit_progress(
+                            req,
+                            format!(
+                                "🔄 第 {}/{} 轮执行中…",
+                                round + 1,
+                                self.cfg.max_continuation_rounds
+                            ),
+                        );
 
-            let response = match self.execute_single_round_with_retry(task_id, req).await {
-                Ok(response) => response,
-                Err(err) => {
-                    let msg = format!("{err:#}");
-                    let _ = self.store.update_status(task_id, TaskStatus::Failed);
-                    let _ = self.store.append_event(
-                        task_id,
-                        "failed",
-                        Some(&serde_json::json!({"reason":"provider_error","error":msg})),
-                    );
-                    emit_progress(req, "❌ 执行失败（provider/transport 错误）。");
-                    return Err(err);
+                        match self.execute_single_round_with_retry(task_id, req).await {
+                            Ok(response) => {
+                                let _ = self.store.increment_attempt_count(task_id);
+                                let _ = self.store.set_last_response(task_id, &response);
+                                TaskEngineState::Verifying { round, response }
+                            }
+                            Err(err) => TaskEngineState::Failed {
+                                round,
+                                reason: "provider_error".to_string(),
+                                error: Some(format!("{err:#}")),
+                            },
+                        }
+                    }
                 }
-            };
+                TaskEngineState::Verifying { round, response } => {
+                    let eval = evaluate_completion(
+                        &contract,
+                        &response,
+                        req.history,
+                        req.original_request,
+                    );
 
-            let _ = self.store.increment_attempt_count(task_id);
-            let _ = self.store.set_last_response(task_id, &response);
-            let eval = evaluate_completion(&contract, &response, req.history, req.original_request);
+                    if eval.saw_post_write_read_after_success && !write_verified {
+                        write_verified = true;
+                        let _ = self.store.upsert_artifact_verification(
+                            task_id,
+                            "__history_verified__",
+                            None,
+                            true,
+                        );
+                        let _ = self
+                            .store
+                            .append_event(task_id, "tool_write_verified", None);
+                        emit_progress(req, "✅ 检测到写后校验证据（write + read/check）。");
+                    }
 
-            if eval.saw_post_write_read_after_success && !write_verified {
-                write_verified = true;
-                let _ = self.store.upsert_artifact_verification(
-                    task_id,
-                    "__history_verified__",
-                    None,
-                    true,
-                );
-                let _ = self
-                    .store
-                    .append_event(task_id, "tool_write_verified", None);
-                emit_progress(req, "✅ 检测到写后校验证据（write + read/check）。");
-            }
+                    match eval.decision {
+                        CompletionDecision::Complete => {
+                            consecutive_progress_only = 0;
+                            TaskEngineState::Completed { round, response }
+                        }
+                        CompletionDecision::Continue {
+                            reason,
+                            missing_requirements,
+                        } => {
+                            let mut verifier_marked_done = false;
+                            if self.cfg.gray_zone_verifier_enabled
+                                && should_invoke_gray_zone_verifier(
+                                    &reason,
+                                    &missing_requirements,
+                                    contract.task_type,
+                                )
+                            {
+                                let verifier_request = GrayZoneVerificationRequest {
+                                    provider: req.provider,
+                                    model: req.model,
+                                    original_request: req.original_request,
+                                    model_response: &response,
+                                    continue_reason: &reason,
+                                    missing_requirements: &missing_requirements,
+                                };
+                                match self.gray_zone_verifier.verify(verifier_request).await {
+                                    Ok(GrayZoneVerdict {
+                                        done: true,
+                                        reason: verifier_reason,
+                                    }) if gray_zone_completion_allowed(
+                                        contract.task_type,
+                                        &missing_requirements,
+                                    ) =>
+                                    {
+                                        let _ = self.store.append_event(
+                                            task_id,
+                                            "gray_zone_verifier",
+                                            Some(&serde_json::json!({
+                                                "result":"done",
+                                                "reason": verifier_reason,
+                                                "round": round + 1
+                                            })),
+                                        );
+                                        consecutive_progress_only = 0;
+                                        verifier_marked_done = true;
+                                    }
+                                    Ok(verdict) => {
+                                        let _ = self.store.append_event(
+                                            task_id,
+                                            "gray_zone_verifier",
+                                            Some(&serde_json::json!({
+                                                "result":"continue",
+                                                "done": verdict.done,
+                                                "reason": verdict.reason,
+                                                "round": round + 1
+                                            })),
+                                        );
+                                    }
+                                    Err(err) => {
+                                        let _ = self.store.append_event(
+                                            task_id,
+                                            "gray_zone_verifier_error",
+                                            Some(&serde_json::json!({
+                                                "error": format!("{err:#}"),
+                                                "round": round + 1
+                                            })),
+                                        );
+                                    }
+                                }
+                            }
 
-            match eval.decision {
-                CompletionDecision::Complete => {
+                            if verifier_marked_done {
+                                TaskEngineState::Completed { round, response }
+                            } else {
+                                let _ = self.store.append_event(
+                                    task_id,
+                                    "continue",
+                                    Some(&serde_json::json!({
+                                        "reason": reason,
+                                        "round": round + 1,
+                                        "missing_requirements": missing_requirements
+                                    })),
+                                );
+                                emit_progress(
+                                    req,
+                                    format!(
+                                        "⏳ 第 {} 轮尚未完成（{}），继续推进…",
+                                        round + 1,
+                                        explain_continue_reason(&reason)
+                                    ),
+                                );
+
+                                consecutive_progress_only += 1;
+                                if consecutive_progress_only >= 3 {
+                                    TaskEngineState::Failed {
+                                        round,
+                                        reason: "stalled_loop".to_string(),
+                                        error: None,
+                                    }
+                                } else {
+                                    req.history.push(ChatMessage::user(
+                                        "[Task Engine]\n任务尚未完成。请继续执行必要的工具操作并在有可验证结果后再给最终答复。不要仅汇报进行中状态。",
+                                    ));
+                                    TaskEngineState::Running { round: round + 1 }
+                                }
+                            }
+                        }
+                        CompletionDecision::Blocked {
+                            reason,
+                            remediation,
+                        } => {
+                            consecutive_progress_only = 0;
+                            TaskEngineState::Blocked {
+                                round,
+                                reason,
+                                remediation,
+                            }
+                        }
+                        CompletionDecision::Failed { reason } => TaskEngineState::Failed {
+                            round,
+                            reason,
+                            error: None,
+                        },
+                    }
+                }
+                TaskEngineState::Completed { round, response } => {
                     let _ = self.store.update_status(task_id, TaskStatus::Completed);
                     let _ = self.store.append_event(
                         task_id,
@@ -230,124 +392,8 @@ impl TaskEngine {
                         write_verified,
                     });
                 }
-                CompletionDecision::Continue {
-                    reason,
-                    missing_requirements,
-                } => {
-                    if self.cfg.gray_zone_verifier_enabled
-                        && should_invoke_gray_zone_verifier(
-                            &reason,
-                            &missing_requirements,
-                            contract.task_type,
-                        )
-                    {
-                        let verifier_request = GrayZoneVerificationRequest {
-                            provider: req.provider,
-                            model: req.model,
-                            original_request: req.original_request,
-                            model_response: &response,
-                            continue_reason: &reason,
-                            missing_requirements: &missing_requirements,
-                        };
-                        match self.gray_zone_verifier.verify(verifier_request).await {
-                            Ok(GrayZoneVerdict {
-                                done: true,
-                                reason: verifier_reason,
-                            }) if gray_zone_completion_allowed(
-                                contract.task_type,
-                                &missing_requirements,
-                            ) =>
-                            {
-                                let _ = self.store.append_event(
-                                    task_id,
-                                    "gray_zone_verifier",
-                                    Some(&serde_json::json!({
-                                        "result":"done",
-                                        "reason": verifier_reason,
-                                        "round": round + 1
-                                    })),
-                                );
-                                let _ = self.store.update_status(task_id, TaskStatus::Completed);
-                                let _ = self.store.append_event(
-                                    task_id,
-                                    "completed",
-                                    Some(&serde_json::json!({
-                                        "round": round + 1,
-                                        "reason":"gray_zone_verifier_done"
-                                    })),
-                                );
-                                emit_progress(
-                                    req,
-                                    format!(
-                                        "✅ 任务完成（第 {} 轮，gray-zone verifier 确认）。",
-                                        round + 1
-                                    ),
-                                );
-                                return Ok(TaskRunOutcome {
-                                    task_id: task_id.to_string(),
-                                    final_response: response,
-                                    write_verified,
-                                });
-                            }
-                            Ok(verdict) => {
-                                let _ = self.store.append_event(
-                                    task_id,
-                                    "gray_zone_verifier",
-                                    Some(&serde_json::json!({
-                                        "result":"continue",
-                                        "done": verdict.done,
-                                        "reason": verdict.reason,
-                                        "round": round + 1
-                                    })),
-                                );
-                            }
-                            Err(err) => {
-                                let _ = self.store.append_event(
-                                    task_id,
-                                    "gray_zone_verifier_error",
-                                    Some(&serde_json::json!({
-                                        "error": format!("{err:#}"),
-                                        "round": round + 1
-                                    })),
-                                );
-                            }
-                        }
-                    }
-
-                    let _ = self.store.append_event(
-                        task_id,
-                        "continue",
-                        Some(&serde_json::json!({
-                            "reason": reason,
-                            "round": round + 1,
-                            "missing_requirements": missing_requirements
-                        })),
-                    );
-                    emit_progress(
-                        req,
-                        format!(
-                            "⏳ 第 {} 轮尚未完成（{}），继续推进…",
-                            round + 1,
-                            explain_continue_reason(&reason)
-                        ),
-                    );
-                    consecutive_progress_only += 1;
-                    if consecutive_progress_only >= 3 {
-                        let msg = "Task stalled in repeated progress-only replies".to_string();
-                        let _ = self.store.update_status(task_id, TaskStatus::Failed);
-                        let _ = self.store.append_event(
-                            task_id,
-                            "failed",
-                            Some(&serde_json::json!({"reason":"stalled_loop"})),
-                        );
-                        emit_progress(req, "❌ 连续进度汇报未产出有效结果，任务失败。");
-                        anyhow::bail!("{msg}");
-                    }
-                    req.history.push(ChatMessage::user(
-                        "[Task Engine]\n任务尚未完成。请继续执行必要的工具操作并在有可验证结果后再给最终答复。不要仅汇报进行中状态。",
-                    ));
-                }
-                CompletionDecision::Blocked {
+                TaskEngineState::Blocked {
+                    round,
                     reason,
                     remediation,
                 } => {
@@ -370,39 +416,72 @@ impl TaskEngine {
                         write_verified,
                     });
                 }
-                CompletionDecision::Failed { reason } => {
+                TaskEngineState::Failed {
+                    round,
+                    reason,
+                    error,
+                } => {
                     let _ = self.store.update_status(task_id, TaskStatus::Failed);
-                    let _ = self.store.append_event(
-                        task_id,
-                        "failed",
-                        Some(&serde_json::json!({
-                            "reason": reason,
-                            "round": round + 1
-                        })),
-                    );
-                    emit_progress(req, "❌ 任务验证失败。");
-                    anyhow::bail!("Task failed verification: {reason}");
+                    match reason.as_str() {
+                        "provider_error" => {
+                            let _ = self.store.append_event(
+                                task_id,
+                                "failed",
+                                Some(&serde_json::json!({
+                                    "reason":"provider_error",
+                                    "error": error.clone().unwrap_or_default(),
+                                    "round": round + 1
+                                })),
+                            );
+                            emit_progress(req, "❌ 执行失败（provider/transport 错误）。");
+                            if let Some(err) = error {
+                                anyhow::bail!("{err}");
+                            }
+                            anyhow::bail!("Task failed with provider error");
+                        }
+                        "max_continuation_rounds_exhausted" => {
+                            let _ = self.store.append_event(
+                                task_id,
+                                "failed",
+                                Some(&serde_json::json!({
+                                    "reason":"max_continuation_rounds_exhausted",
+                                    "max_rounds": self.cfg.max_continuation_rounds
+                                })),
+                            );
+                            emit_progress(
+                                req,
+                                format!(
+                                    "❌ 已达到最大轮数 {}，任务失败。",
+                                    self.cfg.max_continuation_rounds
+                                ),
+                            );
+                            anyhow::bail!(
+                                "Task exceeded max continuation rounds ({})",
+                                self.cfg.max_continuation_rounds
+                            );
+                        }
+                        "stalled_loop" => {
+                            let _ = self.store.append_event(
+                                task_id,
+                                "failed",
+                                Some(&serde_json::json!({"reason":"stalled_loop","round": round + 1})),
+                            );
+                            emit_progress(req, "❌ 连续进度汇报未产出有效结果，任务失败。");
+                            anyhow::bail!("Task stalled in repeated progress-only replies");
+                        }
+                        _ => {
+                            let _ = self.store.append_event(
+                                task_id,
+                                "failed",
+                                Some(&serde_json::json!({"reason":reason,"round": round + 1})),
+                            );
+                            emit_progress(req, "❌ 任务验证失败。");
+                            anyhow::bail!("Task failed verification: {reason}");
+                        }
+                    }
                 }
-            }
+            };
         }
-
-        let _ = self.store.update_status(task_id, TaskStatus::Failed);
-        let _ = self.store.append_event(
-            task_id,
-            "failed",
-            Some(&serde_json::json!({"reason":"max_continuation_rounds_exhausted"})),
-        );
-        emit_progress(
-            req,
-            format!(
-                "❌ 已达到最大轮数 {}，任务失败。",
-                self.cfg.max_continuation_rounds
-            ),
-        );
-        anyhow::bail!(
-            "Task exceeded max continuation rounds ({})",
-            self.cfg.max_continuation_rounds
-        )
     }
 
     async fn execute_single_round_with_retry(
@@ -895,5 +974,235 @@ mod tests {
             .expect("task exists");
         assert!(row.attempt_count >= 2);
         assert_eq!(row.status.as_str(), "completed");
+    }
+
+    #[tokio::test]
+    async fn task_engine_state_machine_running_verifying_completed_transition() {
+        let tmp = TempDir::new().expect("tempdir");
+        let engine = TaskEngine::new(
+            tmp.path(),
+            TaskEngineConfig {
+                max_continuation_rounds: 4,
+                provider_retry_limit: 0,
+                gray_zone_verifier_enabled: false,
+                gray_zone_verifier_timeout_ms: 1500,
+            },
+        )
+        .expect("task engine");
+        let provider = ScriptedProvider::new(vec![
+            Ok("我正在检查当前文件状态。".to_string()),
+            Ok("任务已完成。".to_string()),
+        ]);
+        let observer = NoopObserver;
+        let mut history = vec![
+            ChatMessage::system("system"),
+            ChatMessage::user("请继续处理这个任务"),
+        ];
+        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let req = TaskRunRequest {
+            channel: "imessage",
+            sender_key: "sender-a",
+            reply_target: "sender-a",
+            original_request: "请继续处理这个任务",
+            provider: &provider,
+            history: &mut history,
+            tools_registry: &tools_registry,
+            observer: &observer,
+            provider_name: "test-provider",
+            model: "test-model",
+            temperature: 0.0,
+            multimodal: &crate::config::MultimodalConfig::default(),
+            max_tool_iterations: 5,
+            cancellation_token: None,
+            on_delta: None,
+            hooks: None,
+            excluded_tools: &[],
+            progress_reporter: None,
+        };
+
+        let outcome = TaskEngine::run_task(req, &engine)
+            .await
+            .expect("task should complete");
+        assert_eq!(outcome.final_response, "任务已完成。");
+
+        let events = engine
+            .store()
+            .list_events(&outcome.task_id)
+            .expect("list events");
+        let event_types: Vec<&str> = events.iter().map(|e| e.event_type.as_str()).collect();
+        assert!(event_types.contains(&"continue"));
+        assert!(event_types.contains(&"completed"));
+    }
+
+    #[tokio::test]
+    async fn task_engine_state_machine_running_verifying_blocked_transition() {
+        let tmp = TempDir::new().expect("tempdir");
+        let engine = TaskEngine::new(
+            tmp.path(),
+            TaskEngineConfig {
+                max_continuation_rounds: 4,
+                provider_retry_limit: 0,
+                gray_zone_verifier_enabled: false,
+                gray_zone_verifier_timeout_ms: 1500,
+            },
+        )
+        .expect("task engine");
+        let provider = ScriptedProvider::new(vec![Ok("我会继续分析这个目录。".to_string())]);
+        let observer = NoopObserver;
+        let mut history = vec![
+            ChatMessage::system("system"),
+            ChatMessage::user("分析 studio 目录项目"),
+            ChatMessage::assistant(
+                r#"<tool_call>
+{"name":"file_read","arguments":{"path":"studio"}}
+</tool_call>"#,
+            ),
+            ChatMessage::user(
+                "[Tool results]\n<tool_result name=\"file_read\">\nERROR: path not allowed outside workspace\n</tool_result>",
+            ),
+        ];
+        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let req = TaskRunRequest {
+            channel: "imessage",
+            sender_key: "sender-a",
+            reply_target: "sender-a",
+            original_request: "分析 studio 目录项目",
+            provider: &provider,
+            history: &mut history,
+            tools_registry: &tools_registry,
+            observer: &observer,
+            provider_name: "test-provider",
+            model: "test-model",
+            temperature: 0.0,
+            multimodal: &crate::config::MultimodalConfig::default(),
+            max_tool_iterations: 5,
+            cancellation_token: None,
+            on_delta: None,
+            hooks: None,
+            excluded_tools: &[],
+            progress_reporter: None,
+        };
+
+        let outcome = TaskEngine::run_task(req, &engine)
+            .await
+            .expect("task should be blocked");
+        assert!(outcome.final_response.contains("任务已阻塞"));
+
+        let row = engine
+            .store()
+            .get_task_run(&outcome.task_id)
+            .expect("get task")
+            .expect("task exists");
+        assert_eq!(row.status.as_str(), "blocked");
+    }
+
+    #[tokio::test]
+    async fn task_engine_state_machine_running_verifying_continue_running_transition() {
+        let tmp = TempDir::new().expect("tempdir");
+        let engine = TaskEngine::new(
+            tmp.path(),
+            TaskEngineConfig {
+                max_continuation_rounds: 4,
+                provider_retry_limit: 0,
+                gray_zone_verifier_enabled: false,
+                gray_zone_verifier_timeout_ms: 1500,
+            },
+        )
+        .expect("task engine");
+        let provider = ScriptedProvider::new(vec![
+            Ok("我正在检查当前文件状态。".to_string()),
+            Ok("我正在继续处理，请稍等。".to_string()),
+            Ok("任务已完成。".to_string()),
+        ]);
+        let observer = NoopObserver;
+        let mut history = vec![
+            ChatMessage::system("system"),
+            ChatMessage::user("请继续处理这个任务"),
+        ];
+        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let req = TaskRunRequest {
+            channel: "imessage",
+            sender_key: "sender-a",
+            reply_target: "sender-a",
+            original_request: "请继续处理这个任务",
+            provider: &provider,
+            history: &mut history,
+            tools_registry: &tools_registry,
+            observer: &observer,
+            provider_name: "test-provider",
+            model: "test-model",
+            temperature: 0.0,
+            multimodal: &crate::config::MultimodalConfig::default(),
+            max_tool_iterations: 5,
+            cancellation_token: None,
+            on_delta: None,
+            hooks: None,
+            excluded_tools: &[],
+            progress_reporter: None,
+        };
+
+        let outcome = TaskEngine::run_task(req, &engine)
+            .await
+            .expect("task should complete");
+        assert_eq!(outcome.final_response, "任务已完成。");
+
+        let row = engine
+            .store()
+            .get_task_run(&outcome.task_id)
+            .expect("get task")
+            .expect("task exists");
+        assert!(row.attempt_count >= 3);
+    }
+
+    #[tokio::test]
+    async fn task_engine_state_machine_detects_stalled_loop_after_three_progress_only_rounds() {
+        let tmp = TempDir::new().expect("tempdir");
+        let engine = TaskEngine::new(
+            tmp.path(),
+            TaskEngineConfig {
+                max_continuation_rounds: 4,
+                provider_retry_limit: 0,
+                gray_zone_verifier_enabled: false,
+                gray_zone_verifier_timeout_ms: 1500,
+            },
+        )
+        .expect("task engine");
+        let provider = ScriptedProvider::new(vec![
+            Ok("我正在检查当前文件状态。".to_string()),
+            Ok("我正在继续处理，请稍等。".to_string()),
+            Ok("我会继续处理，请稍等。".to_string()),
+            Ok("还在处理。".to_string()),
+        ]);
+        let observer = NoopObserver;
+        let mut history = vec![
+            ChatMessage::system("system"),
+            ChatMessage::user("请继续处理这个任务"),
+        ];
+        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let req = TaskRunRequest {
+            channel: "imessage",
+            sender_key: "sender-a",
+            reply_target: "sender-a",
+            original_request: "请继续处理这个任务",
+            provider: &provider,
+            history: &mut history,
+            tools_registry: &tools_registry,
+            observer: &observer,
+            provider_name: "test-provider",
+            model: "test-model",
+            temperature: 0.0,
+            multimodal: &crate::config::MultimodalConfig::default(),
+            max_tool_iterations: 5,
+            cancellation_token: None,
+            on_delta: None,
+            hooks: None,
+            excluded_tools: &[],
+            progress_reporter: None,
+        };
+
+        let err = TaskEngine::run_task(req, &engine)
+            .await
+            .expect_err("task should fail due to stalled loop");
+        assert!(format!("{err:#}").contains("stalled"));
     }
 }
