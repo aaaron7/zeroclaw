@@ -106,6 +106,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
         let ws_sender_for_progress = Arc::clone(&sender);
         let progress_pump = tokio::spawn(async move {
             while let Some(progress) = progress_rx.recv().await {
+                println!("  🤖 [progress][web_dashboard]: {}", progress);
                 let progress_frame = serde_json::json!({
                     "type": "progress",
                     "content": progress,

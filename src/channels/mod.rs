@@ -1728,6 +1728,7 @@ async fn process_channel_message(
                                 let thread_ts = msg.thread_ts.clone();
                                 let reporter: crate::agent::task_engine::TaskProgressReporter =
                                     Arc::new(move |progress: String| {
+                                        println!("  🤖 [progress][imessage]: {}", progress);
                                         let channel = Arc::clone(&channel);
                                         let reply_target = reply_target.clone();
                                         let thread_ts = thread_ts.clone();
