@@ -1,5 +1,5 @@
 use crate::providers::ChatMessage;
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 #[derive(Debug, Clone, Default)]
 pub struct EvidenceLedger {
@@ -52,17 +52,32 @@ enum ToolKind {
     Other,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ObservedToolCall {
+    name: String,
+    kind: ToolKind,
+}
+
 pub fn collect_evidence_from_history(history: &[ChatMessage]) -> EvidenceLedger {
     let mut ledger = EvidenceLedger::default();
-    let mut shell_kinds = VecDeque::new();
+    let mut queued_calls = VecDeque::new();
+    let mut calls_by_id = HashMap::new();
 
     for msg in history {
         match msg.role.as_str() {
             "assistant" => {
-                collect_shell_tool_kinds_from_assistant_calls(&msg.content, &mut shell_kinds);
+                collect_assistant_tool_calls(&msg.content, &mut queued_calls, &mut calls_by_id);
             }
             "user" => {
-                collect_tool_result_evidence(&msg.content, &mut shell_kinds, &mut ledger);
+                collect_prompt_tool_result_evidence(&msg.content, &mut queued_calls, &mut ledger);
+            }
+            "tool" => {
+                collect_native_tool_result_evidence(
+                    &msg.content,
+                    &mut queued_calls,
+                    &calls_by_id,
+                    &mut ledger,
+                );
             }
             _ => {}
         }
@@ -71,7 +86,20 @@ pub fn collect_evidence_from_history(history: &[ChatMessage]) -> EvidenceLedger 
     ledger
 }
 
-fn collect_shell_tool_kinds_from_assistant_calls(content: &str, out: &mut VecDeque<ToolKind>) {
+fn collect_assistant_tool_calls(
+    content: &str,
+    queued_calls: &mut VecDeque<ObservedToolCall>,
+    calls_by_id: &mut HashMap<String, ObservedToolCall>,
+) {
+    collect_assistant_tool_calls_from_xml(content, queued_calls, calls_by_id);
+    collect_assistant_tool_calls_from_native_json(content, queued_calls, calls_by_id);
+}
+
+fn collect_assistant_tool_calls_from_xml(
+    content: &str,
+    queued_calls: &mut VecDeque<ObservedToolCall>,
+    calls_by_id: &mut HashMap<String, ObservedToolCall>,
+) {
     const TAG_PAIRS: [(&str, &str); 4] = [
         ("<tool_call>", "</tool_call>"),
         ("<toolcall>", "</toolcall>"),
@@ -88,26 +116,105 @@ fn collect_shell_tool_kinds_from_assistant_calls(content: &str, out: &mut VecDeq
             let Ok(val) = serde_json::from_str::<serde_json::Value>(json_str) else {
                 continue;
             };
-            let Some(name) = val.get("name").and_then(|n| n.as_str()) else {
+            let Some(name) = val.get("name").and_then(serde_json::Value::as_str) else {
                 continue;
             };
-            if name != "shell" {
-                continue;
+            let call = observed_tool_call_from_name_and_args(name, val.get("arguments"));
+            if let Some(call_id) = try_parse_call_id(&val) {
+                calls_by_id.insert(call_id, call.clone());
             }
-            let shell_kind = val
-                .get("arguments")
-                .and_then(|args| args.get("command"))
-                .and_then(|cmd| cmd.as_str())
-                .map(classify_shell_command)
-                .unwrap_or(ToolKind::Other);
-            out.push_back(shell_kind);
+            queued_calls.push_back(call);
         }
     }
 }
 
-fn collect_tool_result_evidence(
+fn collect_assistant_tool_calls_from_native_json(
     content: &str,
-    shell_kinds: &mut VecDeque<ToolKind>,
+    queued_calls: &mut VecDeque<ObservedToolCall>,
+    calls_by_id: &mut HashMap<String, ObservedToolCall>,
+) {
+    let Ok(val) = serde_json::from_str::<serde_json::Value>(content) else {
+        return;
+    };
+    let Some(tool_calls) = val.get("tool_calls").and_then(serde_json::Value::as_array) else {
+        return;
+    };
+
+    for call in tool_calls {
+        let Some(name) = call.get("name").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        let observed = observed_tool_call_from_name_and_args(name, call.get("arguments"));
+        if let Some(call_id) = try_parse_call_id(call) {
+            calls_by_id.insert(call_id, observed.clone());
+        }
+        queued_calls.push_back(observed);
+    }
+}
+
+fn extract_shell_command_from_arguments(arguments: Option<&serde_json::Value>) -> Option<String> {
+    let args = arguments?;
+    match args {
+        serde_json::Value::Object(_) => args
+            .get("command")
+            .and_then(serde_json::Value::as_str)
+            .map(ToString::to_string),
+        serde_json::Value::String(raw) => serde_json::from_str::<serde_json::Value>(raw)
+            .ok()
+            .and_then(|parsed| {
+                parsed
+                    .get("command")
+                    .and_then(serde_json::Value::as_str)
+                    .map(ToString::to_string)
+            }),
+        _ => None,
+    }
+}
+
+fn try_parse_call_id(value: &serde_json::Value) -> Option<String> {
+    value
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| {
+            value
+                .get("tool_call_id")
+                .and_then(serde_json::Value::as_str)
+        })
+        .map(ToString::to_string)
+}
+
+fn observed_tool_call_from_name_and_args(
+    tool_name: &str,
+    arguments: Option<&serde_json::Value>,
+) -> ObservedToolCall {
+    if tool_name == "shell" {
+        let shell_kind = extract_shell_command_from_arguments(arguments)
+            .as_deref()
+            .map(classify_shell_command)
+            .unwrap_or(ToolKind::Other);
+        return ObservedToolCall {
+            name: "shell".to_string(),
+            kind: shell_kind,
+        };
+    }
+    ObservedToolCall {
+        name: tool_name.to_string(),
+        kind: classify_tool_kind(tool_name),
+    }
+}
+
+fn classify_tool_kind(tool_name: &str) -> ToolKind {
+    match tool_name {
+        "file_write" => ToolKind::WriteLike,
+        "file_read" | "glob_search" | "content_search" | "pdf_read" => ToolKind::ReadLike,
+        "web_search_tool" | "http_request" | "browser" | "browser_open" => ToolKind::SearchLike,
+        _ => ToolKind::Other,
+    }
+}
+
+fn collect_prompt_tool_result_evidence(
+    content: &str,
+    queued_calls: &mut VecDeque<ObservedToolCall>,
     ledger: &mut EvidenceLedger,
 ) {
     let marker = "<tool_result name=\"";
@@ -129,40 +236,101 @@ fn collect_tool_result_evidence(
             break;
         };
         let output = after_body_start[..close_idx].trim();
-        let is_success = !tool_result_output_likely_failure(output);
-        let normalized_name = tool_name.trim().to_ascii_lowercase();
-
-        let kind = match tool_name {
-            "file_write" => ToolKind::WriteLike,
-            "file_read" | "glob_search" | "content_search" | "pdf_read" => ToolKind::ReadLike,
-            "web_search_tool" | "http_request" | "browser" | "browser_open" => ToolKind::SearchLike,
-            "shell" => shell_kinds.pop_front().unwrap_or(ToolKind::Other),
-            _ => ToolKind::Other,
-        };
-
-        if is_success {
-            ledger.successful_tools.insert(normalized_name);
+        let normalized = tool_name.trim().to_ascii_lowercase();
+        let call = if normalized == "shell" {
+            queued_calls
+                .pop_front()
+                .unwrap_or_else(|| ObservedToolCall {
+                    name: "shell".to_string(),
+                    kind: ToolKind::Other,
+                })
+        } else if queued_calls
+            .front()
+            .is_some_and(|next| next.name.eq_ignore_ascii_case(&normalized))
+        {
+            queued_calls
+                .pop_front()
+                .unwrap_or_else(|| ObservedToolCall {
+                    name: normalized.clone(),
+                    kind: classify_tool_kind(&normalized),
+                })
         } else {
-            ledger.failed_tools.insert(normalized_name);
-            if tool_result_output_likely_access_denied(output) {
-                ledger.saw_access_denied_failure = true;
+            ObservedToolCall {
+                name: normalized,
+                kind: classify_tool_kind(tool_name),
             }
-        }
-
-        if kind == ToolKind::WriteLike && is_success {
-            ledger.saw_successful_write = true;
-        }
-        if kind == ToolKind::ReadLike && is_success {
-            ledger.saw_successful_read = true;
-        }
-        if kind == ToolKind::ReadLike && is_success && ledger.saw_successful_write {
-            ledger.saw_post_write_read_verification = true;
-        }
-        if kind == ToolKind::SearchLike && is_success {
-            ledger.saw_successful_search = true;
-        }
+        };
+        apply_tool_result_event(call, output, ledger);
 
         remaining = &after_body_start[close_idx + "</tool_result>".len()..];
+    }
+}
+
+fn collect_native_tool_result_evidence(
+    content: &str,
+    queued_calls: &mut VecDeque<ObservedToolCall>,
+    calls_by_id: &HashMap<String, ObservedToolCall>,
+    ledger: &mut EvidenceLedger,
+) {
+    let (tool_call_id, output) =
+        parse_tool_message_payload(content).unwrap_or_else(|| (None, content.trim().to_string()));
+
+    let call = tool_call_id
+        .as_deref()
+        .and_then(|id| calls_by_id.get(id).cloned())
+        .or_else(|| queued_calls.pop_front())
+        .unwrap_or_else(|| ObservedToolCall {
+            name: "unknown".to_string(),
+            kind: ToolKind::Other,
+        });
+    apply_tool_result_event(call, &output, ledger);
+}
+
+fn parse_tool_message_payload(content: &str) -> Option<(Option<String>, String)> {
+    let val = serde_json::from_str::<serde_json::Value>(content).ok()?;
+    let obj = val.as_object()?;
+    let tool_call_id = obj
+        .get("tool_call_id")
+        .and_then(serde_json::Value::as_str)
+        .map(ToString::to_string);
+    let output = obj
+        .get("content")
+        .map(json_value_to_text)
+        .unwrap_or_else(|| content.trim().to_string());
+    Some((tool_call_id, output))
+}
+
+fn json_value_to_text(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(s) => s.clone(),
+        _ => serde_json::to_string(value).unwrap_or_else(|_| String::new()),
+    }
+}
+
+fn apply_tool_result_event(call: ObservedToolCall, output: &str, ledger: &mut EvidenceLedger) {
+    let is_success = !tool_result_output_likely_failure(output);
+    let normalized_name = call.name.trim().to_ascii_lowercase();
+
+    if is_success {
+        ledger.successful_tools.insert(normalized_name);
+    } else {
+        ledger.failed_tools.insert(normalized_name);
+        if tool_result_output_likely_access_denied(output) {
+            ledger.saw_access_denied_failure = true;
+        }
+    }
+
+    if call.kind == ToolKind::WriteLike && is_success {
+        ledger.saw_successful_write = true;
+    }
+    if call.kind == ToolKind::ReadLike && is_success {
+        ledger.saw_successful_read = true;
+    }
+    if call.kind == ToolKind::ReadLike && is_success && ledger.saw_successful_write {
+        ledger.saw_post_write_read_verification = true;
+    }
+    if call.kind == ToolKind::SearchLike && is_success {
+        ledger.saw_successful_search = true;
     }
 }
 
@@ -336,5 +504,27 @@ mod tests {
         let ledger = collect_evidence_from_history(&history);
         assert!(ledger.has_failed_tool("file_read"));
         assert!(ledger.has_access_denied_failure());
+    }
+
+    #[test]
+    fn evidence_ledger_collects_search_from_native_tool_messages() {
+        let history = vec![
+            ChatMessage::assistant(
+                r#"{"content":"","tool_calls":[{"id":"call_web_1","name":"web_search_tool","arguments":{"query":"ai agent skills"}}]}"#,
+            ),
+            ChatMessage::tool(
+                r#"{"tool_call_id":"call_web_1","content":"Top repositories:\n1. example/repo"}"#,
+            ),
+        ];
+
+        let ledger = collect_evidence_from_history(&history);
+        assert!(
+            ledger.has_successful_search(),
+            "native role=tool results should count as search evidence"
+        );
+        assert!(
+            ledger.has_successful_tool("web_search_tool"),
+            "native role=tool results should preserve successful tool name"
+        );
     }
 }

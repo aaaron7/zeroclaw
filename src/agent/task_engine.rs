@@ -74,7 +74,6 @@ pub struct TaskRunRequest<'a> {
 }
 
 const STALLED_PROGRESS_ONLY_LIMIT: usize = 6;
-const ROUND_OUTPUT_PREVIEW_LIMIT: usize = 220;
 
 #[derive(Debug)]
 enum TaskEngineState {
@@ -601,14 +600,7 @@ fn summarize_round_output_for_progress(response: &str) -> String {
     if normalized.is_empty() {
         return "（空响应）".to_string();
     }
-    let mut preview = normalized
-        .chars()
-        .take(ROUND_OUTPUT_PREVIEW_LIMIT)
-        .collect::<String>();
-    if normalized.chars().count() > ROUND_OUTPUT_PREVIEW_LIMIT {
-        preview.push_str("...");
-    }
-    preview
+    normalized
 }
 
 fn explain_continue_reason(reason: &str) -> &str {
@@ -1236,11 +1228,11 @@ mod tests {
     }
 
     #[test]
-    fn summarize_round_output_for_progress_truncates_and_normalizes_whitespace() {
+    fn summarize_round_output_for_progress_keeps_full_content_and_normalizes_whitespace() {
         let raw = format!("  第一行  \n 第二行   {}\n\n", "A".repeat(300));
         let preview = super::summarize_round_output_for_progress(&raw);
         assert!(preview.contains("第一行 第二行"));
-        assert!(preview.ends_with("..."));
-        assert!(preview.chars().count() <= super::ROUND_OUTPUT_PREVIEW_LIMIT + 3);
+        assert!(preview.contains(&"A".repeat(300)));
+        assert!(!preview.ends_with("..."));
     }
 }
