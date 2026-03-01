@@ -1,5 +1,8 @@
 use crate::agent::loop_::run_tool_call_loop;
-use crate::agent::task_completion::{evaluate_completion, CompletionDecision};
+use crate::agent::task_completion::{
+    collect_tool_evidence_snapshot, evaluate_completion_with_request, CompletionDecision,
+    ToolEvidenceSnapshot,
+};
 use crate::agent::task_store::TaskStore;
 use crate::agent::task_types::TaskStatus;
 use crate::config::MultimodalConfig;
@@ -8,6 +11,7 @@ use crate::observability::Observer;
 use crate::providers::{ChatMessage, Provider};
 use crate::tools::Tool;
 use anyhow::Result;
+use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -128,6 +132,8 @@ impl TaskEngine {
         let mut consecutive_progress_only = 0usize;
 
         for round in 0..self.cfg.max_continuation_rounds {
+            let history_len_before_round = req.history.len();
+            let evidence_before_round = collect_tool_evidence_snapshot(req.history);
             emit_progress(
                 req,
                 format!(
@@ -154,7 +160,21 @@ impl TaskEngine {
 
             let _ = self.store.increment_attempt_count(task_id);
             let _ = self.store.set_last_response(task_id, &response);
-            let eval = evaluate_completion(&response, req.history);
+            let round_evidence =
+                collect_tool_evidence_snapshot(&req.history[history_len_before_round..]);
+            emit_round_tool_execution_progress(req, round + 1, &round_evidence);
+            let evidence_after_round = collect_tool_evidence_snapshot(req.history);
+            emit_round_new_evidence_progress(
+                req,
+                round + 1,
+                &evidence_before_round,
+                &evidence_after_round,
+            );
+            let eval = evaluate_completion_with_request(
+                &response,
+                req.history,
+                Some(req.original_request),
+            );
 
             if eval.saw_post_write_read_after_success && !write_verified {
                 write_verified = true;
@@ -199,7 +219,11 @@ impl TaskEngine {
                             explain_continue_reason(&reason)
                         ),
                     );
-                    consecutive_progress_only += 1;
+                    if round_evidence.records.is_empty() {
+                        consecutive_progress_only += 1;
+                    } else {
+                        consecutive_progress_only = 0;
+                    }
                     if consecutive_progress_only >= 3 {
                         let msg = "Task stalled in repeated progress-only replies".to_string();
                         let _ = self.store.update_status(task_id, TaskStatus::Failed);
@@ -317,9 +341,60 @@ fn explain_continue_reason(reason: &str) -> &str {
     match reason {
         "write_claim_without_post_write_verification" => "检测到写入声明但缺少写后校验",
         "in_progress_update" => "仅汇报进行中状态",
+        "search_task_without_search_evidence" => "缺少搜索工具执行证据",
+        "browser_task_without_browser_evidence" => "缺少浏览器工具执行证据",
+        "workspace_analysis_without_read_evidence" => "缺少文件/目录读取证据",
+        "write_task_without_post_write_verification" => "写入任务缺少写后校验证据",
         "guardrail_notice" => "触发 guardrail 继续执行",
         _ => reason,
     }
+}
+
+fn emit_round_tool_execution_progress(
+    req: &TaskRunRequest<'_>,
+    round: usize,
+    evidence: &ToolEvidenceSnapshot,
+) {
+    if evidence.records.is_empty() {
+        emit_progress(req, format!("🛠️ 第 {} 轮工具执行：无", round));
+        return;
+    }
+    let lines = evidence
+        .records
+        .iter()
+        .map(|record| {
+            let status = if record.success { "success" } else { "failed" };
+            format!(
+                "- {}: {} | {}",
+                record.tool_name, status, record.output_excerpt
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    emit_progress(req, format!("🛠️ 第 {} 轮工具执行明细：\n{}", round, lines));
+}
+
+fn emit_round_new_evidence_progress(
+    req: &TaskRunRequest<'_>,
+    round: usize,
+    before: &ToolEvidenceSnapshot,
+    after: &ToolEvidenceSnapshot,
+) {
+    let before_tokens = before.evidence_tokens().into_iter().collect::<HashSet<_>>();
+    let mut new_tokens = after
+        .evidence_tokens()
+        .into_iter()
+        .filter(|token| !before_tokens.contains(token))
+        .collect::<Vec<_>>();
+    new_tokens.sort();
+    if new_tokens.is_empty() {
+        emit_progress(req, format!("📎 第 {} 轮新增证据：无", round));
+        return;
+    }
+    emit_progress(
+        req,
+        format!("📎 第 {} 轮新增证据：{}", round, new_tokens.join(", ")),
+    );
 }
 
 #[cfg(test)]
@@ -480,5 +555,62 @@ mod tests {
             .expect("task exists");
         assert!(row.provider_retry_count >= 1);
         assert_eq!(row.status.as_str(), "completed");
+    }
+
+    #[tokio::test]
+    async fn run_task_blocks_workspace_analysis_hallucination_without_read_evidence() {
+        let tmp = TempDir::new().expect("tempdir");
+        let engine = TaskEngine::new(
+            tmp.path(),
+            TaskEngineConfig {
+                max_continuation_rounds: 3,
+                provider_retry_limit: 0,
+            },
+        )
+        .expect("task engine");
+        let provider = ScriptedProvider::new(vec![
+            Ok("我已经分析完 studio 项目结构，这是一个 React 项目。".to_string()),
+            Ok("无法访问该路径：符号链接指向 workspace 外部，请在 [autonomy].allowed_roots 放行后重试。"
+                .to_string()),
+        ]);
+        let observer = NoopObserver;
+        let mut history = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user("帮我分析 studio 目录项目"),
+        ];
+        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let req = TaskRunRequest {
+            channel: "imessage",
+            sender_key: "sender-a",
+            reply_target: "sender-a",
+            original_request: "帮我分析 studio 目录项目",
+            provider: &provider,
+            history: &mut history,
+            tools_registry: &tools_registry,
+            observer: &observer,
+            provider_name: "test-provider",
+            model: "test-model",
+            temperature: 0.0,
+            multimodal: &crate::config::MultimodalConfig::default(),
+            max_tool_iterations: 5,
+            cancellation_token: None,
+            on_delta: None,
+            hooks: None,
+            excluded_tools: &[],
+            progress_reporter: None,
+        };
+
+        let outcome = TaskEngine::run_task(req, &engine)
+            .await
+            .expect("task should continue and then complete with explicit blocked outcome");
+        assert!(outcome.final_response.contains("无法访问该路径"));
+
+        let row = engine
+            .store()
+            .get_task_run(&outcome.task_id)
+            .expect("get task")
+            .expect("task exists");
+        assert_eq!(row.status.as_str(), "completed");
+        assert!(row.attempt_count >= 2);
     }
 }

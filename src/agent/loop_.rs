@@ -321,6 +321,54 @@ fn response_contains_chinese(text: &str) -> bool {
     contains_cjk(text)
 }
 
+fn looks_like_tool_capability_limitation_response(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    let explicit_hints = [
+        "cannot access the internet",
+        "can't access the internet",
+        "cannot browse",
+        "can't browse",
+        "no real-time access",
+        "don't have real-time access",
+        "unable to access the internet",
+        "无法联网",
+        "不能联网",
+        "无法访问互联网",
+        "不能访问互联网",
+        "无法实时",
+        "不能实时",
+        "不能直接联网",
+        "无法直接联网",
+    ];
+
+    if explicit_hints
+        .iter()
+        .any(|hint| lower.contains(hint) || text.contains(hint))
+    {
+        return true;
+    }
+
+    // Chinese semantic combination fallback: "can't/unable" + network/real-time/news cues.
+    let has_cn_cannot = text.contains("不能") || text.contains("无法");
+    let has_cn_network = text.contains("联网") || text.contains("互联网");
+    let has_cn_realtime = text.contains("实时") || text.contains("今天");
+    let has_cn_news = text.contains("新闻") || text.contains("要闻");
+    if has_cn_cannot && (has_cn_network || (has_cn_realtime && has_cn_news)) {
+        return true;
+    }
+
+    // English semantic combination fallback.
+    let has_en_cannot =
+        lower.contains("cannot") || lower.contains("can't") || lower.contains("unable");
+    let has_en_network = lower.contains("internet") || lower.contains("browse");
+    let has_en_realtime = lower.contains("real-time") || lower.contains("realtime");
+    if has_en_cannot && (has_en_network || has_en_realtime) {
+        return true;
+    }
+
+    false
+}
+
 fn looks_like_premature_pause_request(text: &str) -> bool {
     let lower = text.to_lowercase();
     let completion_hints = [
@@ -367,6 +415,64 @@ fn looks_like_premature_pause_request(text: &str) -> bool {
     pause_hints
         .iter()
         .any(|hint| lower.contains(hint) || text.contains(hint))
+}
+
+fn user_requested_brainstorming_skill(history: &[ChatMessage]) -> bool {
+    for msg in history.iter().rev() {
+        if msg.role != "user" {
+            continue;
+        }
+        let content = msg.content.trim();
+        if content.is_empty() {
+            continue;
+        }
+
+        let lower = content.to_lowercase();
+        if lower.contains("$brainstorming")
+            || lower.contains(" brainstorming")
+            || lower.starts_with("brainstorming")
+            || content.contains("brainstorming")
+            || content.contains("头脑风暴")
+            || content.contains("脑暴")
+        {
+            return true;
+        }
+        return false;
+    }
+    false
+}
+
+fn looks_like_brainstorming_clarifying_question(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    if !(text.contains('?') || text.contains('？')) {
+        return false;
+    }
+
+    let scope_hints = [
+        "goal",
+        "target",
+        "scope",
+        "constraint",
+        "success criteria",
+        "requirement",
+        "option",
+        "audience",
+        "目标",
+        "范围",
+        "约束",
+        "成功标准",
+        "需求",
+        "方案",
+        "受众",
+        "问题",
+        "请问",
+    ];
+    let has_scope_hint = scope_hints
+        .iter()
+        .any(|hint| lower.contains(hint) || text.contains(hint));
+    let question_count = text.matches('?').count() + text.matches('？').count();
+
+    has_scope_hint && question_count <= 3
 }
 
 fn user_requested_filesystem_inspection(history: &[ChatMessage]) -> bool {
@@ -2399,7 +2505,7 @@ pub(crate) async fn run_tool_call_loop(
         .filter(|tool| !excluded_tools.iter().any(|ex| ex == tool.name()))
         .map(|tool| tool.spec())
         .collect();
-    let use_native_tools = provider.supports_native_tools() && !tool_specs.is_empty();
+    let mut use_native_tools = provider.supports_native_tools() && !tool_specs.is_empty();
     let turn_id = Uuid::new_v4().to_string();
     let mut seen_tool_signatures: HashSet<(String, String)> = HashSet::new();
     let mut saw_verified_filesystem_write = false;
@@ -2408,8 +2514,11 @@ pub(crate) async fn run_tool_call_loop(
     let mut language_guard_hits: u32 = 0;
     let mut autonomy_guard_hits: u32 = 0;
     let mut filesystem_analysis_guard_hits: u32 = 0;
+    let mut brainstorming_guard_hits: u32 = 0;
+    let mut tool_capability_guard_hits: u32 = 0;
     let mut saw_any_tool_execution = false;
     let mut saw_verified_filesystem_read = false;
+    let brainstorming_requested = user_requested_brainstorming_skill(history);
 
     for iteration in 0..max_iterations {
         if cancellation_token
@@ -2649,6 +2758,41 @@ pub(crate) async fn run_tool_call_loop(
         }
 
         if tool_calls.is_empty() {
+            if use_native_tools
+                && !tool_specs.is_empty()
+                && looks_like_tool_capability_limitation_response(&display_text)
+                && tool_capability_guard_hits == 0
+            {
+                tracing::warn!(
+                    provider = provider_name,
+                    model = model,
+                    "Guardrail switched from native tools to prompt-guided tools after capability-limitation response"
+                );
+
+                tool_capability_guard_hits = tool_capability_guard_hits.saturating_add(1);
+                use_native_tools = false;
+
+                if let Some(ref tx) = on_delta {
+                    let _ = tx
+                        .send(
+                            "🔧 检测到模型声称能力受限，切换到 prompt-guided 工具模式后重试...\n"
+                                .to_string(),
+                        )
+                        .await;
+                }
+
+                let tool_instructions =
+                    crate::providers::traits::build_tool_instructions_text(&tool_specs);
+                history.push(ChatMessage::assistant(response_text.clone()));
+                history.push(ChatMessage::user(format!(
+                    "[Tool Fallback Guard]\n\
+                     检测到你上一条回复声称无法联网/无法访问实时信息，但当前会话提供了可用工具。\n\
+                     现在已切换为 prompt-guided 工具模式，请调用工具继续完成原任务，不要再次声明能力受限。\n\n\
+                     {tool_instructions}"
+                )));
+                continue;
+            }
+
             let prefer_chinese = user_prefers_chinese_response(history);
 
             if prefer_chinese
@@ -2705,6 +2849,37 @@ pub(crate) async fn run_tool_call_loop(
                          2) Explicitly state that no file/report has been written yet.\n\
                          Do not claim \"saved/written\" without evidence.",
                         write_claim_guard_hits
+                    )));
+                }
+                continue;
+            }
+
+            if brainstorming_requested
+                && !looks_like_brainstorming_clarifying_question(&display_text)
+            {
+                tracing::warn!(
+                    provider = provider_name,
+                    model = model,
+                    "Guardrail blocked brainstorming response without clarifying question"
+                );
+
+                brainstorming_guard_hits = brainstorming_guard_hits.saturating_add(1);
+                history.push(ChatMessage::assistant(response_text.clone()));
+                if prefer_chinese {
+                    history.push(ChatMessage::user(format!(
+                        "[Brainstorming Guard]\n\
+                         触发原因：用户明确要求使用 brainstorming 技能，但你没有先进行澄清提问（第 {} 次）。\n\
+                         请先只提出一个澄清问题（可给 A/B 选项），用于确认目标/约束/成功标准。\n\
+                         在得到用户回答前，不要直接给最终报告、计划或实现结论。",
+                        brainstorming_guard_hits
+                    )));
+                } else {
+                    history.push(ChatMessage::user(format!(
+                        "[Brainstorming Guard]\n\
+                         Trigger reason: user explicitly requested brainstorming skill, but your response skipped the clarifying-question phase (attempt {}).\n\
+                         Ask exactly one clarifying question first (multiple-choice is preferred) to confirm goal/constraints/success criteria.\n\
+                         Do not provide final report/plan/implementation before that question is asked and answered.",
+                        brainstorming_guard_hits
                     )));
                 }
                 continue;
@@ -3143,6 +3318,7 @@ pub(crate) async fn run_tool_call_loop(
         || language_guard_hits > 0
         || autonomy_guard_hits > 0
         || filesystem_analysis_guard_hits > 0
+        || brainstorming_guard_hits > 0
     {
         let prefer_chinese = user_prefers_chinese_response(history);
         let mut reasons: Vec<&str> = Vec::new();
@@ -3162,6 +3338,9 @@ pub(crate) async fn run_tool_call_loop(
                 "目录/项目分析声明缺少可验证读取证据 / filesystem analysis claim lacked verifiable read evidence",
             );
         }
+        if brainstorming_guard_hits > 0 {
+            reasons.push("brainstorming 技能流程未启动 / brainstorming clarifying-question phase was skipped");
+        }
         let reason_lines = reasons
             .iter()
             .map(|reason| format!("- {reason}"))
@@ -3175,6 +3354,7 @@ pub(crate) async fn run_tool_call_loop(
             language_guard_hits,
             autonomy_guard_hits,
             filesystem_analysis_guard_hits,
+            brainstorming_guard_hits,
             "Guardrail exhausted max iterations; returning soft-fail notice"
         );
 
@@ -3192,6 +3372,7 @@ pub(crate) async fn run_tool_call_loop(
                 "language_guard_hits": language_guard_hits,
                 "autonomy_guard_hits": autonomy_guard_hits,
                 "filesystem_analysis_guard_hits": filesystem_analysis_guard_hits,
+                "brainstorming_guard_hits": brainstorming_guard_hits,
             }),
         );
 
@@ -4743,6 +4924,91 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_tool_call_loop_soft_fails_when_brainstorming_skips_question_phase() {
+        let provider = ScriptedProvider::from_text_responses(vec![
+            "我已经完成分析报告并整理好最终方案。",
+            "我已经完成分析报告并整理好最终方案。",
+            "我已经完成分析报告并整理好最终方案。",
+            "我已经完成分析报告并整理好最终方案。",
+        ]);
+
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("请用 $brainstorming 技能帮我做一份分析报告"),
+        ];
+        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let observer = NoopObserver;
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "cli",
+            &crate::config::MultimodalConfig::default(),
+            4,
+            None,
+            None,
+            None,
+            &[],
+        )
+        .await
+        .expect("brainstorming guard should return soft-fail notice");
+
+        assert!(result.contains("[Guardrail Notice]"));
+        assert!(result.contains("brainstorming"));
+        assert!(
+            history
+                .iter()
+                .any(|msg| msg.content.contains("[Brainstorming Guard]")),
+            "brainstorming guard should inject correction instruction into history"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_allows_brainstorming_when_clarifying_question_present() {
+        let provider = ScriptedProvider::from_text_responses(vec![
+            "为了开始 brainstorming，我先确认一个问题：这份报告的主要受众是谁？",
+        ]);
+
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("请用 brainstorming 帮我推进这个功能设计"),
+        ];
+        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let observer = NoopObserver;
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "cli",
+            &crate::config::MultimodalConfig::default(),
+            4,
+            None,
+            None,
+            None,
+            &[],
+        )
+        .await
+        .expect("clarifying-question response should pass brainstorming guard");
+
+        assert!(result.contains("我先确认一个问题"));
+        assert!(result.contains('？'));
+    }
+
+    #[tokio::test]
     async fn run_tool_call_loop_executes_multiple_tools_with_ordered_results() {
         let provider = ScriptedProvider::from_text_responses(vec![
             r#"<tool_call>
@@ -4942,6 +5208,66 @@ mod tests {
                 .iter()
                 .all(|msg| !(msg.role == "user" && msg.content.starts_with("[Tool results]"))),
             "native mode should use role=tool history instead of prompt fallback wrapper"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_switches_to_prompt_guided_after_native_limitation_claim() {
+        let provider = ScriptedProvider::from_text_responses(vec![
+            "我目前不能直接联网抓取今天的实时新闻。",
+            r#"<tool_call>
+{"name":"count_tool","arguments":{"value":"news"}}
+</tool_call>"#,
+            "done",
+        ])
+        .with_native_tool_support();
+
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(CountingTool::new(
+            "count_tool",
+            Arc::clone(&invocations),
+        ))];
+
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("搜一下今天的新闻"),
+        ];
+        let observer = NoopObserver;
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "web",
+            &crate::config::MultimodalConfig::default(),
+            4,
+            None,
+            None,
+            None,
+            &[],
+        )
+        .await
+        .expect("tool fallback guard should recover and complete");
+
+        assert_eq!(result, "done");
+        assert_eq!(invocations.load(Ordering::SeqCst), 1);
+        assert!(
+            history
+                .iter()
+                .any(|msg| msg.role == "user" && msg.content.contains("[Tool Fallback Guard]")),
+            "history should record the tool fallback guard instruction"
+        );
+        assert!(
+            history
+                .iter()
+                .any(|msg| msg.role == "user" && msg.content.starts_with("[Tool results]")),
+            "after switching to prompt-guided mode, tool results should use prompt wrapper"
         );
     }
 
@@ -6101,6 +6427,22 @@ Let me check the result."#;
     }
 
     #[test]
+    fn tool_capability_limitation_detection_matches_common_phrases() {
+        assert!(looks_like_tool_capability_limitation_response(
+            "I currently can't browse real-time news."
+        ));
+        assert!(looks_like_tool_capability_limitation_response(
+            "我目前不能直接联网抓取今天的新闻。"
+        ));
+        assert!(looks_like_tool_capability_limitation_response(
+            "我这边不能直接实时联网抓取“今天”的新闻。"
+        ));
+        assert!(!looks_like_tool_capability_limitation_response(
+            "我正在调用工具搜索新闻。"
+        ));
+    }
+
+    #[test]
     fn user_prefers_chinese_response_detects_chinese_latest_user_turn() {
         let history = vec![
             ChatMessage::system("system"),
@@ -6180,6 +6522,31 @@ Let me check the result."#;
         ));
         assert!(!looks_like_filesystem_analysis_claim(
             "该路径无法访问，读取失败，请先放开 allowed_roots。"
+        ));
+    }
+
+    #[test]
+    fn brainstorming_request_detection_matches_explicit_triggers() {
+        let history = vec![
+            ChatMessage::system("system"),
+            ChatMessage::user("请用 $brainstorming 做这个需求"),
+        ];
+        assert!(user_requested_brainstorming_skill(&history));
+
+        let history2 = vec![
+            ChatMessage::system("system"),
+            ChatMessage::user("请用 brainstorming 帮我推进"),
+        ];
+        assert!(user_requested_brainstorming_skill(&history2));
+    }
+
+    #[test]
+    fn brainstorming_question_detection_requires_scope_question() {
+        assert!(looks_like_brainstorming_clarifying_question(
+            "为了开始 brainstorming，我先确认一个问题：目标受众是谁？"
+        ));
+        assert!(!looks_like_brainstorming_clarifying_question(
+            "我已经完成了设计并给出最终方案。"
         ));
     }
 
