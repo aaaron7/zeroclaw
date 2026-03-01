@@ -12,7 +12,9 @@ pub mod sse;
 pub mod static_files;
 pub mod ws;
 
-use crate::channels::{Channel, LinqChannel, NextcloudTalkChannel, SendMessage, WatiChannel, WhatsAppChannel};
+use crate::channels::{
+    Channel, LinqChannel, NextcloudTalkChannel, SendMessage, WatiChannel, WhatsAppChannel,
+};
 use crate::config::Config;
 use crate::cost::CostTracker;
 use crate::memory::{self, Memory, MemoryCategory};
@@ -22,6 +24,7 @@ use crate::security::pairing::{constant_time_eq, is_public_bind, PairingGuard};
 use crate::security::SecurityPolicy;
 use crate::tools;
 use crate::tools::traits::ToolSpec;
+use crate::tools::Tool;
 use crate::util::truncate_with_ellipsis;
 use anyhow::{Context, Result};
 use axum::{
@@ -305,6 +308,18 @@ pub struct AppState {
     pub observer: Arc<dyn crate::observability::Observer>,
     /// Registered tool specs (for web dashboard tools page)
     pub tools_registry: Arc<Vec<ToolSpec>>,
+    /// Runtime tool registry used by `/ws/chat` agent execution.
+    pub runtime_tools: Arc<Vec<Box<dyn Tool>>>,
+    /// Autonomous task engine used by WebSocket agent chat and channel flows.
+    pub task_engine: Option<Arc<crate::agent::task_engine::TaskEngine>>,
+    /// Optional lifecycle hooks.
+    pub hooks: Option<Arc<crate::hooks::HookRunner>>,
+    /// Agent iteration budget for autonomous runs.
+    pub max_tool_iterations: usize,
+    /// Multimodal limits used by chat preparation.
+    pub multimodal: crate::config::MultimodalConfig,
+    /// Tool exclusions for non-CLI channels.
+    pub non_cli_excluded_tools: Arc<Vec<String>>,
     /// Cost tracker (optional, for web dashboard cost page)
     pub cost_tracker: Option<Arc<CostTracker>>,
     /// SSE broadcast channel for real-time events
@@ -390,8 +405,21 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         config.api_key.as_deref(),
         &config,
     );
+    let runtime_tools: Arc<Vec<Box<dyn Tool>>> = Arc::new(tools_registry_raw);
     let tools_registry: Arc<Vec<ToolSpec>> =
-        Arc::new(tools_registry_raw.iter().map(|t| t.spec()).collect());
+        Arc::new(runtime_tools.iter().map(|t| t.spec()).collect());
+
+    let task_engine = match crate::agent::task_engine::TaskEngine::default_for_workspace(
+        &config.workspace_dir,
+    ) {
+        Ok(engine) => Some(Arc::new(engine)),
+        Err(err) => {
+            tracing::warn!(
+                    "Failed to initialize task engine for gateway/ws chat; autonomous mode disabled: {err}"
+                );
+            None
+        }
+    };
 
     // Cost tracker (optional)
     let cost_tracker = if config.cost.enabled {
@@ -640,6 +668,12 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         wati: wati_channel,
         observer: broadcast_observer,
         tools_registry,
+        runtime_tools,
+        task_engine,
+        hooks: hooks.clone(),
+        max_tool_iterations: config.agent.max_tool_iterations,
+        multimodal: config.multimodal.clone(),
+        non_cli_excluded_tools: Arc::new(config.autonomy.non_cli_excluded_tools.clone()),
         cost_tracker,
         event_tx,
     };
@@ -1342,10 +1376,7 @@ pub struct WatiVerifyQuery {
 }
 
 /// POST /wati — incoming WATI WhatsApp message webhook
-async fn handle_wati_webhook(
-    State(state): State<AppState>,
-    body: Bytes,
-) -> impl IntoResponse {
+async fn handle_wati_webhook(State(state): State<AppState>, body: Bytes) -> impl IntoResponse {
     let Some(ref wati) = state.wati else {
         return (
             StatusCode::NOT_FOUND,
@@ -1594,6 +1625,12 @@ mod tests {
             wati: None,
             observer: Arc::new(crate::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
+            runtime_tools: Arc::new(Vec::new()),
+            task_engine: None,
+            hooks: None,
+            max_tool_iterations: 4,
+            multimodal: crate::config::MultimodalConfig::default(),
+            non_cli_excluded_tools: Arc::new(Vec::new()),
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
         };
@@ -1643,6 +1680,12 @@ mod tests {
             wati: None,
             observer,
             tools_registry: Arc::new(Vec::new()),
+            runtime_tools: Arc::new(Vec::new()),
+            task_engine: None,
+            hooks: None,
+            max_tool_iterations: 4,
+            multimodal: crate::config::MultimodalConfig::default(),
+            non_cli_excluded_tools: Arc::new(Vec::new()),
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
         };
@@ -2009,6 +2052,12 @@ mod tests {
             wati: None,
             observer: Arc::new(crate::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
+            runtime_tools: Arc::new(Vec::new()),
+            task_engine: None,
+            hooks: None,
+            max_tool_iterations: 4,
+            multimodal: crate::config::MultimodalConfig::default(),
+            non_cli_excluded_tools: Arc::new(Vec::new()),
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
         };
@@ -2073,6 +2122,12 @@ mod tests {
             wati: None,
             observer: Arc::new(crate::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
+            runtime_tools: Arc::new(Vec::new()),
+            task_engine: None,
+            hooks: None,
+            max_tool_iterations: 4,
+            multimodal: crate::config::MultimodalConfig::default(),
+            non_cli_excluded_tools: Arc::new(Vec::new()),
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
         };
@@ -2149,6 +2204,12 @@ mod tests {
             wati: None,
             observer: Arc::new(crate::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
+            runtime_tools: Arc::new(Vec::new()),
+            task_engine: None,
+            hooks: None,
+            max_tool_iterations: 4,
+            multimodal: crate::config::MultimodalConfig::default(),
+            non_cli_excluded_tools: Arc::new(Vec::new()),
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
         };
@@ -2197,6 +2258,12 @@ mod tests {
             wati: None,
             observer: Arc::new(crate::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
+            runtime_tools: Arc::new(Vec::new()),
+            task_engine: None,
+            hooks: None,
+            max_tool_iterations: 4,
+            multimodal: crate::config::MultimodalConfig::default(),
+            non_cli_excluded_tools: Arc::new(Vec::new()),
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
         };
@@ -2250,6 +2317,12 @@ mod tests {
             wati: None,
             observer: Arc::new(crate::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
+            runtime_tools: Arc::new(Vec::new()),
+            task_engine: None,
+            hooks: None,
+            max_tool_iterations: 4,
+            multimodal: crate::config::MultimodalConfig::default(),
+            non_cli_excluded_tools: Arc::new(Vec::new()),
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
         };
@@ -2308,6 +2381,12 @@ mod tests {
             wati: None,
             observer: Arc::new(crate::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
+            runtime_tools: Arc::new(Vec::new()),
+            task_engine: None,
+            hooks: None,
+            max_tool_iterations: 4,
+            multimodal: crate::config::MultimodalConfig::default(),
+            non_cli_excluded_tools: Arc::new(Vec::new()),
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
         };
@@ -2362,6 +2441,12 @@ mod tests {
             wati: None,
             observer: Arc::new(crate::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
+            runtime_tools: Arc::new(Vec::new()),
+            task_engine: None,
+            hooks: None,
+            max_tool_iterations: 4,
+            multimodal: crate::config::MultimodalConfig::default(),
+            non_cli_excluded_tools: Arc::new(Vec::new()),
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
         };

@@ -1486,9 +1486,7 @@ async fn process_channel_message(
 
     println!(
         "  💬 [{}] from {}: {}",
-        msg.channel,
-        msg.sender,
-        truncate_with_ellipsis(&msg.content, 80)
+        msg.channel, msg.sender, msg.content
     );
     runtime_trace::record_event(
         "channel_message_inbound",
@@ -1714,8 +1712,10 @@ async fn process_channel_message(
                                 let channel = Arc::clone(channel);
                                 let reply_target = msg.reply_target.clone();
                                 let thread_ts = msg.thread_ts.clone();
+                                let progress_channel = msg.channel.clone();
                                 let reporter: crate::agent::task_engine::TaskProgressReporter =
                                     Arc::new(move |progress: String| {
+                                        println!("  🤖 [progress][{}]: {}", progress_channel, progress);
                                         let channel = Arc::clone(&channel);
                                         let reply_target = reply_target.clone();
                                         let thread_ts = thread_ts.clone();
@@ -1938,7 +1938,7 @@ async fn process_channel_message(
             println!(
                 "  🤖 Reply ({}ms): {}",
                 started_at.elapsed().as_millis(),
-                truncate_with_ellipsis(&delivered_response, 80)
+                delivered_response
             );
             if let Some(channel) = target_channel.as_ref() {
                 if let Some(ref draft_id) = draft_message_id {
