@@ -40,6 +40,21 @@ export default function AgentChat() {
 
     ws.onMessage = (msg: WsMessage) => {
       switch (msg.type) {
+        case 'progress':
+          if (msg.content) {
+            setMessages((prev) => [
+              ...prev,
+              {
+                id: crypto.randomUUID(),
+                role: 'agent',
+                content: `[Progress] ${msg.content}`,
+                timestamp: new Date(),
+              },
+            ]);
+          }
+          setTyping(true);
+          break;
+
         case 'chunk':
           setTyping(true);
           pendingContentRef.current += msg.content ?? '';

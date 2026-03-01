@@ -95,7 +95,7 @@ export interface SSEEvent {
 }
 
 export interface WsMessage {
-  type: 'message' | 'chunk' | 'tool_call' | 'tool_result' | 'done' | 'error';
+  type: 'message' | 'progress' | 'chunk' | 'tool_call' | 'tool_result' | 'done' | 'error';
   content?: string;
   full_response?: string;
   name?: string;

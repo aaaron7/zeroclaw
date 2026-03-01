@@ -1475,6 +1475,18 @@ fn spawn_scoped_typing_task(
     handle
 }
 
+fn should_print_full_terminal_message(channel: &str) -> bool {
+    matches!(channel, "imessage" | "web_dashboard")
+}
+
+fn format_terminal_message(channel: &str, content: &str) -> String {
+    if should_print_full_terminal_message(channel) {
+        content.to_string()
+    } else {
+        truncate_with_ellipsis(content, 80)
+    }
+}
+
 async fn process_channel_message(
     ctx: Arc<ChannelRuntimeContext>,
     msg: traits::ChannelMessage,
@@ -1486,7 +1498,9 @@ async fn process_channel_message(
 
     println!(
         "  💬 [{}] from {}: {}",
-        msg.channel, msg.sender, msg.content
+        msg.channel,
+        msg.sender,
+        format_terminal_message(&msg.channel, &msg.content)
     );
     runtime_trace::record_event(
         "channel_message_inbound",
@@ -1712,10 +1726,9 @@ async fn process_channel_message(
                                 let channel = Arc::clone(channel);
                                 let reply_target = msg.reply_target.clone();
                                 let thread_ts = msg.thread_ts.clone();
-                                let progress_channel = msg.channel.clone();
                                 let reporter: crate::agent::task_engine::TaskProgressReporter =
                                     Arc::new(move |progress: String| {
-                                        println!("  🤖 [progress][{}]: {}", progress_channel, progress);
+                                        println!("  🤖 [progress][imessage]: {}", progress);
                                         let channel = Arc::clone(&channel);
                                         let reply_target = reply_target.clone();
                                         let thread_ts = thread_ts.clone();
@@ -1938,7 +1951,7 @@ async fn process_channel_message(
             println!(
                 "  🤖 Reply ({}ms): {}",
                 started_at.elapsed().as_millis(),
-                delivered_response
+                format_terminal_message(&msg.channel, &delivered_response)
             );
             if let Some(channel) = target_channel.as_ref() {
                 if let Some(ref draft_id) = draft_message_id {
@@ -2000,6 +2013,11 @@ async fn process_channel_message(
                 } else {
                     "⚠️ Context window exceeded for this conversation. Please resend your last message."
                 };
+                println!(
+                    "  🤖 Reply ({}ms): {}",
+                    started_at.elapsed().as_millis(),
+                    format_terminal_message(&msg.channel, error_text)
+                );
                 eprintln!(
                     "  ⚠️ Context window exceeded after {}ms; sender history compacted={}",
                     started_at.elapsed().as_millis(),
@@ -2038,6 +2056,12 @@ async fn process_channel_message(
                     "  ❌ LLM error after {}ms: {e}",
                     started_at.elapsed().as_millis()
                 );
+                let outbound_error = format!("⚠️ Error: {e}");
+                println!(
+                    "  🤖 Reply ({}ms): {}",
+                    started_at.elapsed().as_millis(),
+                    format_terminal_message(&msg.channel, &outbound_error)
+                );
                 let safe_error = providers::sanitize_api_error(&e.to_string());
                 runtime_trace::record_event(
                     "channel_message_error",
@@ -2070,12 +2094,12 @@ async fn process_channel_message(
                 if let Some(channel) = target_channel.as_ref() {
                     if let Some(ref draft_id) = draft_message_id {
                         let _ = channel
-                            .finalize_draft(&msg.reply_target, draft_id, &format!("⚠️ Error: {e}"))
+                            .finalize_draft(&msg.reply_target, draft_id, &outbound_error)
                             .await;
                     } else {
                         let _ = channel
                             .send(
-                                &SendMessage::new(format!("⚠️ Error: {e}"), &msg.reply_target)
+                                &SendMessage::new(outbound_error, &msg.reply_target)
                                     .in_thread(msg.thread_ts.clone()),
                             )
                             .await;
@@ -2116,6 +2140,11 @@ async fn process_channel_message(
             if let Some(channel) = target_channel.as_ref() {
                 let error_text =
                     "⚠️ Request timed out while waiting for the model. Please try again.";
+                println!(
+                    "  🤖 Reply ({}ms): {}",
+                    started_at.elapsed().as_millis(),
+                    format_terminal_message(&msg.channel, error_text)
+                );
                 if let Some(ref draft_id) = draft_message_id {
                     let _ = channel
                         .finalize_draft(&msg.reply_target, draft_id, error_text)
@@ -3375,8 +3404,13 @@ pub async fn start_channels(config: Config) -> Result<()> {
         .telegram
         .as_ref()
         .is_some_and(|tg| tg.interrupt_on_new_message);
+    let task_engine_cfg = crate::agent::task_engine::TaskEngineConfig {
+        gray_zone_verifier_enabled: config.autonomy.gray_zone_verifier_enabled,
+        gray_zone_verifier_timeout_ms: config.autonomy.gray_zone_verifier_timeout_ms,
+        ..crate::agent::task_engine::TaskEngineConfig::default()
+    };
     let task_engine =
-        match crate::agent::task_engine::TaskEngine::default_for_workspace(&config.workspace_dir) {
+        match crate::agent::task_engine::TaskEngine::new(&config.workspace_dir, task_engine_cfg) {
             Ok(engine) => Some(Arc::new(engine)),
             Err(err) => {
                 tracing::warn!(
@@ -4612,6 +4646,8 @@ BTC is currently around $65,000 based on latest tool output."#
             crate::agent::task_engine::TaskEngineConfig {
                 max_continuation_rounds: 4,
                 provider_retry_limit: 0,
+                gray_zone_verifier_enabled: false,
+                gray_zone_verifier_timeout_ms: 1500,
             },
         )
         .expect("task engine");

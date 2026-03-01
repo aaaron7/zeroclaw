@@ -1,11 +1,16 @@
 #[allow(clippy::module_inception)]
 pub mod agent;
 pub mod classifier;
+pub mod contract_gate;
 pub mod dispatcher;
+pub mod evidence_ledger;
+pub mod gray_zone_verifier;
 pub mod loop_;
 pub mod memory_loader;
 pub mod prompt;
 pub mod task_completion;
+pub mod task_contract;
+pub mod task_contract_compiler;
 pub mod task_engine;
 pub mod task_store;
 pub mod task_types;
@@ -16,4 +21,4 @@ mod tests;
 #[allow(unused_imports)]
 pub use agent::{Agent, AgentBuilder};
 #[allow(unused_imports)]
-pub use loop_::{process_message, run};
+pub use loop_::{process_message, process_message_with_channel, run};
