@@ -1016,6 +1016,19 @@ impl OpenAiCompatibleProvider {
         modified_messages
     }
 
+    fn responses_fallback_messages(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&[crate::tools::ToolSpec]>,
+    ) -> Vec<ChatMessage> {
+        let with_prompt_guided_tools = Self::with_prompt_guided_tool_instructions(messages, tools);
+        if self.merge_system_into_user {
+            Self::flatten_system_messages(&with_prompt_guided_tools)
+        } else {
+            with_prompt_guided_tools
+        }
+    }
+
     fn parse_native_response(message: ResponseMessage) -> ProviderChatResponse {
         let text = message.effective_content_optional();
         let reasoning_content = message.reasoning_content.clone();
@@ -1453,6 +1466,8 @@ impl Provider for OpenAiCompatibleProvider {
         } else {
             request.messages.to_vec()
         };
+        let responses_fallback_messages =
+            self.responses_fallback_messages(request.messages, request.tools);
         let native_request = NativeChatRequest {
             model: model.to_string(),
             messages: Self::convert_messages_for_native(&effective_messages),
@@ -1476,7 +1491,7 @@ impl Provider for OpenAiCompatibleProvider {
                 if self.supports_responses_fallback {
                     let sanitized = super::sanitize_api_error(&chat_error.to_string());
                     return self
-                        .chat_via_responses(credential, &effective_messages, model)
+                        .chat_via_responses(credential, &responses_fallback_messages, model)
                         .await
                         .map(|text| ProviderChatResponse {
                             text: Some(text),
@@ -1517,7 +1532,7 @@ impl Provider for OpenAiCompatibleProvider {
 
             if status == reqwest::StatusCode::NOT_FOUND && self.supports_responses_fallback {
                 return self
-                    .chat_via_responses(credential, &effective_messages, model)
+                    .chat_via_responses(credential, &responses_fallback_messages, model)
                     .await
                     .map(|text| ProviderChatResponse {
                         text: Some(text),
@@ -2260,6 +2275,66 @@ mod tests {
         assert_eq!(output[0].role, "system");
         assert!(output[0].content.contains("Available Tools"));
         assert!(output[0].content.contains("shell_exec"));
+    }
+
+    #[test]
+    fn responses_fallback_messages_inject_prompt_guided_tools() {
+        let provider = make_provider("custom", "https://example.com/v1", Some("k"));
+        let input = vec![ChatMessage::user("请读取 README")];
+        let tools = vec![crate::tools::ToolSpec {
+            name: "file_read".to_string(),
+            description: "Read a file".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string" }
+                },
+                "required": ["path"]
+            }),
+        }];
+
+        let output = provider.responses_fallback_messages(&input, Some(&tools));
+        assert!(!output.is_empty());
+        assert_eq!(output[0].role, "system");
+        assert!(output[0].content.contains("Available Tools"));
+        assert!(output[0].content.contains("file_read"));
+        assert!(output
+            .iter()
+            .any(|m| m.role == "user" && m.content.contains("README")));
+    }
+
+    #[test]
+    fn responses_fallback_messages_flattens_for_merge_system_provider() {
+        let provider = OpenAiCompatibleProvider::new_merge_system_into_user(
+            "minimax",
+            "https://api.minimax.example/v1",
+            Some("k"),
+            AuthStyle::Bearer,
+        );
+        let input = vec![
+            ChatMessage::system("core policy"),
+            ChatMessage::user("run diagnostics"),
+        ];
+        let tools = vec![crate::tools::ToolSpec {
+            name: "shell".to_string(),
+            description: "Run shell command".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "command": { "type": "string" }
+                },
+                "required": ["command"]
+            }),
+        }];
+
+        let output = provider.responses_fallback_messages(&input, Some(&tools));
+        assert!(!output.is_empty());
+        assert!(output.iter().all(|m| m.role != "system"));
+        assert_eq!(output[0].role, "user");
+        assert!(output[0].content.contains("core policy"));
+        assert!(output[0].content.contains("Available Tools"));
+        assert!(output[0].content.contains("shell"));
+        assert!(output[0].content.contains("run diagnostics"));
     }
 
     #[tokio::test]
