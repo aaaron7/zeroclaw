@@ -4592,6 +4592,21 @@ mod tests {
         assert!(a.require_approval_for_medium_risk);
         assert!(a.block_high_risk_commands);
         assert!(a.shell_env_passthrough.is_empty());
+        assert!(a.contract_completion_engine);
+        assert!(a.gray_zone_verifier_enabled);
+        assert!(a.gray_zone_verifier_timeout_ms > 0);
+    }
+
+    #[test]
+    async fn autonomy_gray_zone_verifier_timeout_must_be_positive() {
+        let mut cfg = Config::default();
+        cfg.autonomy.gray_zone_verifier_timeout_ms = 0;
+        let err = cfg
+            .validate()
+            .expect_err("timeout=0 must be rejected by config validation");
+        assert!(err
+            .to_string()
+            .contains("autonomy.gray_zone_verifier_timeout_ms must be greater than 0"));
     }
 
     #[test]
