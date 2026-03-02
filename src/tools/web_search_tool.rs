@@ -202,8 +202,9 @@ impl WebSearchTool {
         let item_regex =
             Regex::new(r#"<li[^>]*class="[^"]*\bb_algo\b[^"]*"[^>]*>([\s\S]*?)</li>"#)?;
         // Extract primary headline link from each block (`h2 > a`).
-        let headline_link_regex =
-            Regex::new(r#"<h2[^>]*>\s*<a[^>]*href="(https?://[^"]+)"[^>]*>([\s\S]*?)</a>\s*</h2>"#)?;
+        let headline_link_regex = Regex::new(
+            r#"<h2[^>]*>\s*<a[^>]*href="(https?://[^"]+)"[^>]*>([\s\S]*?)</a>\s*</h2>"#,
+        )?;
         // Extract first snippet paragraph if available.
         let snippet_regex = Regex::new(r#"<p[^>]*>([\s\S]*?)</p>"#)?;
 
@@ -424,10 +425,18 @@ impl Tool for WebSearchTool {
             "bing" => self.search_bing(query).await?,
             "brave" => self.search_brave(query).await?,
             "firecrawl" => self.search_firecrawl(query).await?,
-            _ => anyhow::bail!(
-                "Unknown search provider: '{}'. Set tools.web_search.provider to 'duckduckgo', 'bing', 'brave', or 'firecrawl' in config.toml",
-                self.provider
-            ),
+            _ => {
+                let supported = if cfg!(feature = "firecrawl") {
+                    "'duckduckgo', 'bing', 'brave', or 'firecrawl'"
+                } else {
+                    "'duckduckgo', 'bing', or 'brave'"
+                };
+                anyhow::bail!(
+                    "Unknown search provider: '{}'. Set tools.web_search.provider to {} in config.toml",
+                    self.provider,
+                    supported
+                )
+            }
         };
 
         Ok(ToolResult {
@@ -772,10 +781,12 @@ mod tests {
         );
         let result = tool.execute(json!({"query": "test"})).await;
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("'duckduckgo', 'bing', 'brave', or 'firecrawl'"));
+        let error = result.unwrap_err().to_string();
+        if cfg!(feature = "firecrawl") {
+            assert!(error.contains("'duckduckgo', 'bing', 'brave', or 'firecrawl'"));
+        } else {
+            assert!(error.contains("'duckduckgo', 'bing', or 'brave'"));
+        }
     }
 
     #[tokio::test]
