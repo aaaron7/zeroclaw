@@ -201,8 +201,9 @@ impl WebSearchTool {
         // Extract item blocks from Bing result list.
         let item_regex =
             Regex::new(r#"<li[^>]*class="[^"]*\bb_algo\b[^"]*"[^>]*>([\s\S]*?)</li>"#)?;
-        // Extract top link from each block.
-        let link_regex = Regex::new(r#"<a[^>]*href="(https?://[^"]+)"[^>]*>([\s\S]*?)</a>"#)?;
+        // Extract primary headline link from each block (`h2 > a`).
+        let headline_link_regex =
+            Regex::new(r#"<h2[^>]*>\s*<a[^>]*href="(https?://[^"]+)"[^>]*>([\s\S]*?)</a>\s*</h2>"#)?;
         // Extract first snippet paragraph if available.
         let snippet_regex = Regex::new(r#"<p[^>]*>([\s\S]*?)</p>"#)?;
 
@@ -215,7 +216,7 @@ impl WebSearchTool {
             }
 
             let block = &block_caps[1];
-            let Some(link_caps) = link_regex.captures(block) else {
+            let Some(link_caps) = headline_link_regex.captures(block) else {
                 continue;
             };
 
@@ -615,6 +616,61 @@ mod tests {
         "#;
         let result = tool.parse_bing_results(html, "test").unwrap();
         assert!(result.contains("No results found"));
+    }
+
+    #[test]
+    fn test_parse_bing_results_prefers_headline_link() {
+        let tool = WebSearchTool::new(
+            test_security(),
+            "bing".to_string(),
+            None,
+            None,
+            5,
+            15,
+            "test".to_string(),
+        );
+        let html = r#"
+            <li class="b_algo">
+                <div class="b_attribution"><a href="https://tracking.example.com/redirect">tracking link</a></div>
+                <h2><a href="https://example.com/headline">Headline Result</a></h2>
+                <div class="b_caption"><p>Primary snippet</p></div>
+            </li>
+        "#;
+        let result = tool.parse_bing_results(html, "test").unwrap();
+        assert!(result.contains("Headline Result"));
+        assert!(result.contains("https://example.com/headline"));
+        assert!(!result.contains("https://tracking.example.com/redirect"));
+    }
+
+    #[test]
+    fn test_parse_bing_results_max_results_boundary() {
+        let tool = WebSearchTool::new(
+            test_security(),
+            "bing".to_string(),
+            None,
+            None,
+            5,
+            15,
+            "test".to_string(),
+        );
+        let mut html = String::new();
+        for i in 1..=6 {
+            html.push_str(&format!(
+                r#"<li class="b_algo"><h2><a href="https://example.com/{i}">Title {i}</a></h2><div class="b_caption"><p>Snippet {i}</p></div></li>"#
+            ));
+        }
+
+        let result = tool.parse_bing_results(&html, "test").unwrap();
+
+        for i in 1..=5 {
+            assert!(result.contains(&format!("Title {i}")));
+            assert!(result.contains(&format!("https://example.com/{i}")));
+            assert!(result.contains(&format!("Snippet {i}")));
+        }
+
+        assert!(!result.contains("Title 6"));
+        assert!(!result.contains("https://example.com/6"));
+        assert!(!result.contains("Snippet 6"));
     }
 
     #[test]
