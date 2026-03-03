@@ -7,7 +7,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 /// Web search tool for searching the internet.
-/// Supports providers: DuckDuckGo (free), Bing (free), Brave, Firecrawl.
+#[cfg_attr(
+    feature = "firecrawl",
+    doc = "Supports providers: DuckDuckGo (free), Bing (free), Brave, Firecrawl."
+)]
+#[cfg_attr(
+    not(feature = "firecrawl"),
+    doc = "Supports providers: DuckDuckGo (free), Bing (free), Brave."
+)]
 pub struct WebSearchTool {
     security: Arc<SecurityPolicy>,
     provider: String,
